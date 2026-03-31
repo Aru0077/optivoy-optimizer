@@ -1,0 +1,22 @@
+services:
+  optimizer:
+    image: optivoy-optimizer:prod
+    container_name: optivoy-optimizer
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8088:8088'
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8088/health\", timeout=3).read()"',
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

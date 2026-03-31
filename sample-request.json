@@ -1,0 +1,96 @@
+{
+  "city": "Beijing",
+  "province": "Beijing",
+  "arrivalAirportCode": "PEK",
+  "departureAirportCode": "PEK",
+  "arrivalAirportId": "airport-pek",
+  "departureAirportId": "airport-pek",
+  "arrivalAirport": {
+    "latitude": 39.5099,
+    "longitude": 116.4109
+  },
+  "departureAirport": {
+    "latitude": 39.5099,
+    "longitude": 116.4109
+  },
+  "arrivalDateTime": "2026-04-01T14:00:00+08:00",
+  "airportBufferMinutes": 90,
+  "points": [
+    {
+      "id": "spot-a",
+      "pointType": "spot",
+      "suggestedDurationMinutes": 120,
+      "latitude": 39.915,
+      "longitude": 116.404
+    },
+    {
+      "id": "mall-c",
+      "pointType": "shopping",
+      "suggestedDurationMinutes": 150,
+      "latitude": 39.905,
+      "longitude": 116.43
+    },
+    {
+      "id": "food-d",
+      "pointType": "restaurant",
+      "suggestedDurationMinutes": 90,
+      "latitude": 39.92,
+      "longitude": 116.42
+    }
+  ],
+  "hotels": [
+    {
+      "id": "hotel-1",
+      "latitude": 39.91,
+      "longitude": 116.41
+    },
+    {
+      "id": "hotel-2",
+      "latitude": 39.93,
+      "longitude": 116.41
+    }
+  ],
+  "distanceMatrix": {
+    "rows": [
+      {
+        "fromPointId": "airport-pek",
+        "toPointId": "spot-a",
+        "transitMinutes": 75,
+        "drivingMinutes": 55,
+        "walkingMeters": 34000,
+        "distanceKm": 35.2,
+        "transitSummary": "机场线 -> 地铁2号线"
+      },
+      {
+        "fromPointId": "spot-a",
+        "toPointId": "mall-c",
+        "transitMinutes": 22,
+        "drivingMinutes": 18,
+        "walkingMeters": 1800,
+        "distanceKm": 7.1
+      },
+      {
+        "fromPointId": "mall-c",
+        "toPointId": "food-d",
+        "transitMinutes": 16,
+        "drivingMinutes": 12,
+        "walkingMeters": 1200,
+        "distanceKm": 4.2
+      },
+      {
+        "fromPointId": "food-d",
+        "toPointId": "hotel-1",
+        "transitMinutes": 14,
+        "drivingMinutes": 10,
+        "walkingMeters": 950,
+        "distanceKm": 3.6
+      }
+    ]
+  },
+  "paceMode": "standard",
+  "hotelMode": "multi",
+  "mealPolicy": "auto",
+  "objective": "min_days_then_transit",
+  "maxDays": 14,
+  "timeLimitSeconds": 2.5
+}
