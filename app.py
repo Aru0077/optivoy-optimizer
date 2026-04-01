@@ -88,6 +88,11 @@ class SolveRequest(BaseModel):
     )
     maxDays: int = PydField(default=14, ge=1, le=14)
     timeLimitSeconds: float = PydField(default=2.5, ge=0.2, le=30.0)
+    switchPenaltyMinutes: int = PydField(default=45, ge=0, le=600)
+    newHotelPenaltyMinutes: int = PydField(default=30, ge=0, le=600)
+    maxIterations: int = PydField(default=3, ge=1, le=8)
+    badDayTransitMinutesThreshold: int = PydField(default=0, ge=0, le=5000)
+    badDayPenaltyMinutes: int = PydField(default=120, ge=0, le=5000)
 
 
 class DayPlan(BaseModel):
@@ -102,6 +107,7 @@ class SolveResponse(BaseModel):
     solverStatus: Literal["OPTIMAL", "FEASIBLE"]
     objective: str
     days: list[DayPlan]
+    diagnostics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -534,6 +540,560 @@ def phase1_assign_days(
         used_calendar_days=used_day_indexes,
         solver_status=solver_status,
     )
+
+
+@dataclass(frozen=True)
+class HardDayPattern:
+    calendar_day: int
+    hotel_id: str
+    point_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SoftDayPattern:
+    calendar_day: int
+    hotel_id: str
+    point_indexes: tuple[int, ...]
+    penalty_minutes: int
+
+
+@dataclass
+class MasterResult:
+    day_point_indexes: list[list[int]]
+    used_calendar_days: list[int]
+    hotel_ids: list[str]
+    solver_status: Literal["OPTIMAL", "FEASIBLE"]
+
+
+@dataclass
+class SubproblemResult:
+    orderings: list[list[int]]
+    day_travel_minutes: list[int]
+    day_total_minutes: list[int]
+    over_budget_minutes: list[int]
+
+
+def _compute_day_budgets(req: SolveRequest, day_slots: int) -> list[int]:
+    pace_start, pace_end, pace_minutes = PACE_MODE_WINDOWS[req.paceMode]
+    has_restaurant = any(p.pointType == "restaurant" for p in req.points)
+    meal_overhead = 45 if req.mealPolicy == "auto" and not has_restaurant else 0
+
+    daily_budget = pace_minutes - meal_overhead
+    if daily_budget < 120:
+        raise HTTPException(status_code=400, detail="daily playable minutes too low")
+
+    first_day_budget = _first_day_budget(
+        req.arrivalDateTime,
+        req.airportBufferMinutes,
+        pace_start,
+        pace_end,
+        pace_minutes,
+        meal_overhead,
+    )
+
+    budgets = [daily_budget for _ in range(day_slots)]
+    if day_slots > 0:
+        budgets[0] = first_day_budget
+    return budgets
+
+
+def phase1_assign_days_and_hotels(
+    req: SolveRequest,
+    lookup: dict[tuple[str, str], int],
+    hard_patterns: list[HardDayPattern] | None = None,
+    soft_patterns: list[SoftDayPattern] | None = None,
+) -> MasterResult:
+    n = len(req.points)
+    k = len(req.hotels)
+    d = min(n + 1, req.maxDays + 1)
+    if n <= 0 or k <= 0:
+        raise HTTPException(status_code=400, detail="points/hotels cannot be empty")
+
+    point_loads = [
+        p.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES for p in req.points
+    ]
+    day_budgets = _compute_day_budgets(req, d)
+
+    if any(load > max(day_budgets) for load in point_loads):
+        raise HTTPException(
+            status_code=400,
+            detail="at least one point duration exceeds daily budget",
+        )
+
+    model = cp_model.CpModel()
+
+    x = [[model.NewBoolVar(f"x_{i}_{day}") for day in range(d)] for i in range(n)]
+    used = [model.NewBoolVar(f"u_{day}") for day in range(d)]
+    z = [
+        [model.NewBoolVar(f"z_{day}_{hotel}") for hotel in range(k)]
+        for day in range(d)
+    ]
+
+    for i in range(n):
+        model.Add(sum(x[i]) == 1)
+
+    for day in range(d):
+        model.Add(
+            sum(point_loads[i] * x[i][day] for i in range(n))
+            <= day_budgets[day] * used[day]
+        )
+        model.Add(sum(x[i][day] for i in range(n)) >= used[day])
+        model.Add(sum(z[day][hotel] for hotel in range(k)) == used[day])
+
+    for day in range(1, d - 1):
+        model.Add(used[day] >= used[day + 1])
+    model.Add(sum(used) <= req.maxDays)
+
+    hotel_used = [model.NewBoolVar(f"hotel_used_{hotel}") for hotel in range(k)]
+    for hotel in range(k):
+        for day in range(d):
+            model.Add(hotel_used[hotel] >= z[day][hotel])
+
+    if req.hotelMode == "single":
+        model.Add(sum(hotel_used) == 1)
+
+    used_days_expr = sum(used)
+    day_pack_penalty = sum(
+        (day + 1) * x[i][day] for i in range(n) for day in range(d)
+    )
+
+    point_pair_terms: list[cp_model.LinearExpr] = []
+    if req.objective in ("min_transit", "min_days_then_transit") and n <= 60:
+        for i in range(n):
+            for j in range(i + 1, n):
+                cost = symmetric(
+                    req.points[i].id,
+                    coord_of(req.points[i]),
+                    req.points[j].id,
+                    coord_of(req.points[j]),
+                    lookup,
+                )
+                for day in range(d):
+                    y = model.NewBoolVar(f"pair_{i}_{j}_{day}")
+                    model.Add(y <= x[i][day])
+                    model.Add(y <= x[j][day])
+                    model.Add(y >= x[i][day] + x[j][day] - 1)
+                    point_pair_terms.append(y * cost)
+    point_pair_proxy = sum(point_pair_terms)
+
+    hotel_proxy_terms: list[cp_model.LinearExpr] = []
+    for i in range(n):
+        point = req.points[i]
+        point_coord = coord_of(point)
+        for day in range(d):
+            for hotel in range(k):
+                h = req.hotels[hotel]
+                h_coord = coord_of(h)
+                y = model.NewBoolVar(f"p2h_{i}_{day}_{hotel}")
+                model.Add(y <= x[i][day])
+                model.Add(y <= z[day][hotel])
+                model.Add(y >= x[i][day] + z[day][hotel] - 1)
+                hotel_cost = directed(
+                    h.id,
+                    h_coord,
+                    point.id,
+                    point_coord,
+                    lookup,
+                ) + directed(
+                    point.id,
+                    point_coord,
+                    h.id,
+                    h_coord,
+                    lookup,
+                )
+                hotel_proxy_terms.append(y * hotel_cost)
+    hotel_proxy_penalty = sum(hotel_proxy_terms)
+
+    switch_terms: list[cp_model.LinearExpr] = []
+    for day in range(1, d):
+        same_hotel_bits: list[cp_model.IntVar] = []
+        for hotel in range(k):
+            both = model.NewBoolVar(f"same_{day}_{hotel}")
+            model.Add(both <= z[day - 1][hotel])
+            model.Add(both <= z[day][hotel])
+            model.Add(both >= z[day - 1][hotel] + z[day][hotel] - 1)
+            same_hotel_bits.append(both)
+
+        same_expr = sum(same_hotel_bits)
+        switched = model.NewBoolVar(f"switch_{day}")
+        model.Add(switched >= used[day - 1] + used[day] - 1 - same_expr)
+        model.Add(switched <= used[day - 1])
+        model.Add(switched <= used[day])
+        switch_terms.append(switched * req.switchPenaltyMinutes)
+    switch_penalty = sum(switch_terms)
+
+    new_hotel_penalty = sum(
+        hotel_used[hotel] * req.newHotelPenaltyMinutes for hotel in range(k)
+    )
+
+    hotel_index_by_id = {hotel.id: idx for idx, hotel in enumerate(req.hotels)}
+    if hard_patterns:
+        for pattern in hard_patterns:
+            if pattern.calendar_day < 0 or pattern.calendar_day >= d:
+                continue
+            h_idx = hotel_index_by_id.get(pattern.hotel_id)
+            if h_idx is None:
+                continue
+            point_indexes = [
+                idx for idx in pattern.point_indexes if 0 <= idx < n
+            ]
+            if not point_indexes:
+                continue
+            model.Add(
+                sum(x[idx][pattern.calendar_day] for idx in point_indexes)
+                + z[pattern.calendar_day][h_idx]
+                <= len(point_indexes)
+            )
+
+    feedback_penalty_terms: list[cp_model.LinearExpr] = []
+    if soft_patterns:
+        for pattern_idx, pattern in enumerate(soft_patterns):
+            if pattern.penalty_minutes <= 0:
+                continue
+            if pattern.calendar_day < 0 or pattern.calendar_day >= d:
+                continue
+            h_idx = hotel_index_by_id.get(pattern.hotel_id)
+            if h_idx is None:
+                continue
+            point_indexes = [
+                idx for idx in pattern.point_indexes if 0 <= idx < n
+            ]
+            if not point_indexes:
+                continue
+
+            matched = model.NewBoolVar(f"fb_{pattern_idx}")
+            model.Add(matched <= z[pattern.calendar_day][h_idx])
+            for idx in point_indexes:
+                model.Add(matched <= x[idx][pattern.calendar_day])
+            model.Add(
+                matched
+                >= z[pattern.calendar_day][h_idx]
+                + sum(x[idx][pattern.calendar_day] for idx in point_indexes)
+                - len(point_indexes)
+            )
+            feedback_penalty_terms.append(matched * pattern.penalty_minutes)
+    feedback_penalty = sum(feedback_penalty_terms)
+
+    transit_structure_penalty = (
+        point_pair_proxy
+        + day_pack_penalty
+        + hotel_proxy_penalty
+        + switch_penalty
+        + new_hotel_penalty
+        + feedback_penalty
+    )
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = 8
+    phase1_time = max(0.2, req.timeLimitSeconds * 0.4)
+    phase2_time = max(0.2, req.timeLimitSeconds * 0.5)
+
+    lex_first_status: int | None = None
+
+    if req.objective == "min_days":
+        solver.parameters.max_time_in_seconds = phase1_time + phase2_time
+        model.Minimize(used_days_expr * 10000 + day_pack_penalty)
+        status = solver.Solve(model)
+    elif req.objective == "min_transit":
+        solver.parameters.max_time_in_seconds = phase1_time + phase2_time
+        model.Minimize(used_days_expr * 10000 + transit_structure_penalty)
+        status = solver.Solve(model)
+    else:
+        solver.parameters.max_time_in_seconds = phase1_time
+        model.Minimize(used_days_expr)
+        lex_first_status = solver.Solve(model)
+        if lex_first_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise HTTPException(
+                status_code=503, detail="solver failed to find feasible plan"
+            )
+        min_days_found = sum(solver.Value(day_used) for day_used in used)
+        if lex_first_status == cp_model.OPTIMAL:
+            model.Add(used_days_expr == min_days_found)
+            model.Minimize(transit_structure_penalty)
+        else:
+            model.Add(used_days_expr <= min_days_found)
+            model.Minimize(used_days_expr * 10000 + transit_structure_penalty)
+        solver.parameters.max_time_in_seconds = phase2_time
+        status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise HTTPException(
+            status_code=503, detail="solver failed to find feasible plan"
+        )
+
+    used_day_indexes = [day for day in range(d) if solver.Value(used[day]) == 1]
+    if not used_day_indexes:
+        raise HTTPException(
+            status_code=503, detail="solver returned empty day set"
+        )
+
+    day_position_by_index = {
+        day_idx: pos for pos, day_idx in enumerate(used_day_indexes)
+    }
+    day_indexes: list[list[int]] = [[] for _ in range(len(used_day_indexes))]
+    hotel_ids: list[str] = ["" for _ in range(len(used_day_indexes))]
+
+    for i in range(n):
+        assigned_day = None
+        for day in range(d):
+            if solver.Value(x[i][day]) == 1:
+                assigned_day = day
+                break
+        if assigned_day is None:
+            raise HTTPException(
+                status_code=503, detail="solver assignment is invalid"
+            )
+        pos = day_position_by_index.get(assigned_day)
+        if pos is None:
+            raise HTTPException(
+                status_code=503, detail="solver used-day mapping is invalid"
+            )
+        day_indexes[pos].append(i)
+
+    for day in used_day_indexes:
+        pos = day_position_by_index[day]
+        hotel_idx = None
+        for h in range(k):
+            if solver.Value(z[day][h]) == 1:
+                hotel_idx = h
+                break
+        if hotel_idx is None:
+            raise HTTPException(
+                status_code=503, detail="solver hotel assignment is invalid"
+            )
+        hotel_ids[pos] = req.hotels[hotel_idx].id
+
+    solver_status: Literal["OPTIMAL", "FEASIBLE"] = "OPTIMAL"
+    if status != cp_model.OPTIMAL:
+        solver_status = "FEASIBLE"
+    if (
+        req.objective == "min_days_then_transit"
+        and lex_first_status == cp_model.FEASIBLE
+    ):
+        solver_status = "FEASIBLE"
+
+    return MasterResult(
+        day_point_indexes=day_indexes,
+        used_calendar_days=used_day_indexes,
+        hotel_ids=hotel_ids,
+        solver_status=solver_status,
+    )
+
+
+def _solve_fixed_day_route(
+    day_points: list[PointIn],
+    start_id: str,
+    start_coord: Coord,
+    end_hotel: HotelIn,
+    lookup: dict[tuple[str, str], int],
+) -> DayRoute:
+    if len(day_points) <= MAX_EXACT_PERMUTATION_SIZE:
+        coord_map = {
+            start_id: start_coord,
+            end_hotel.id: coord_of(end_hotel),
+        }
+        routes = _precompute_day_exact(
+            day_points,
+            [start_id],
+            [end_hotel],
+            coord_map,
+            lookup,
+        )
+        route = routes.get((start_id, end_hotel.id))
+        if route is not None:
+            return route
+
+    return _nn_order(
+        day_points,
+        start_id,
+        start_coord,
+        end_hotel.id,
+        coord_of(end_hotel),
+        lookup,
+    )
+
+
+def phase2_solve_fixed_hotels(
+    req: SolveRequest,
+    master: MasterResult,
+    lookup: dict[tuple[str, str], int],
+) -> SubproblemResult:
+    arrival = _arrival_anchor(req)
+    day_slot_count = min(len(req.points) + 1, req.maxDays + 1)
+    day_budgets = _compute_day_budgets(req, day_slot_count)
+    point_loads = [
+        p.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES for p in req.points
+    ]
+
+    hotel_by_id = {hotel.id: hotel for hotel in req.hotels}
+
+    orderings: list[list[int]] = []
+    day_travel_minutes: list[int] = []
+    day_total_minutes: list[int] = []
+    over_budget_minutes: list[int] = []
+
+    for pos, point_indexes in enumerate(master.day_point_indexes):
+        hotel_id = master.hotel_ids[pos]
+        end_hotel = hotel_by_id.get(hotel_id)
+        if end_hotel is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"hotel id {hotel_id} not found in request",
+            )
+
+        if pos == 0:
+            if master.used_calendar_days[0] > 0:
+                start_id = hotel_id
+                start_coord = coord_of(end_hotel)
+            elif arrival and arrival.node_id:
+                start_id = arrival.node_id
+                start_coord = arrival.coord
+            else:
+                start_id = hotel_id
+                start_coord = coord_of(end_hotel)
+        else:
+            prev_hotel_id = master.hotel_ids[pos - 1]
+            prev_hotel = hotel_by_id.get(prev_hotel_id)
+            if prev_hotel is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"hotel id {prev_hotel_id} not found in request",
+                )
+            start_id = prev_hotel_id
+            start_coord = coord_of(prev_hotel)
+
+        day_points = [req.points[idx] for idx in point_indexes]
+        route = _solve_fixed_day_route(
+            day_points,
+            start_id,
+            start_coord,
+            end_hotel,
+            lookup,
+        )
+
+        service_minutes = sum(point_loads[idx] for idx in point_indexes)
+        total_minutes = service_minutes + route.cost
+        calendar_day = master.used_calendar_days[pos]
+        budget = (
+            day_budgets[calendar_day]
+            if 0 <= calendar_day < len(day_budgets)
+            else day_budgets[-1]
+        )
+        over_budget = max(0, total_minutes - budget)
+
+        orderings.append(route.ordering)
+        day_travel_minutes.append(route.cost)
+        day_total_minutes.append(total_minutes)
+        over_budget_minutes.append(over_budget)
+
+    return SubproblemResult(
+        orderings=orderings,
+        day_travel_minutes=day_travel_minutes,
+        day_total_minutes=day_total_minutes,
+        over_budget_minutes=over_budget_minutes,
+    )
+
+
+def _pattern_key(
+    calendar_day: int,
+    hotel_id: str,
+    point_indexes: list[int],
+) -> tuple[int, str, tuple[int, ...]]:
+    uniq = tuple(sorted(set(point_indexes)))
+    return (calendar_day, hotel_id, uniq)
+
+
+def solve_with_layered_iteration(
+    req: SolveRequest,
+    lookup: dict[tuple[str, str], int],
+) -> tuple[MasterResult, SubproblemResult, list[dict[str, int]]]:
+    hard_patterns: list[HardDayPattern] = []
+    soft_patterns: list[SoftDayPattern] = []
+    seen_hard: set[tuple[int, str, tuple[int, ...]]] = set()
+    seen_soft: set[tuple[int, str, tuple[int, ...]]] = set()
+
+    best_pair: tuple[MasterResult, SubproblemResult] | None = None
+    best_score: int | None = None
+    traces: list[dict[str, int]] = []
+
+    for _ in range(req.maxIterations):
+        try:
+            master = phase1_assign_days_and_hotels(
+                req=req,
+                lookup=lookup,
+                hard_patterns=hard_patterns,
+                soft_patterns=soft_patterns,
+            )
+        except HTTPException:
+            if best_pair is not None:
+                return best_pair
+            raise
+
+        sub = phase2_solve_fixed_hotels(req, master, lookup)
+
+        total_over = sum(sub.over_budget_minutes)
+        total_travel = sum(sub.day_travel_minutes)
+        score = total_over * 100000 + total_travel
+        if best_score is None or score < best_score:
+            best_score = score
+            best_pair = (master, sub)
+
+        new_hard = 0
+        new_soft = 0
+
+        for pos, point_indexes in enumerate(master.day_point_indexes):
+            calendar_day = master.used_calendar_days[pos]
+            hotel_id = master.hotel_ids[pos]
+            key = _pattern_key(calendar_day, hotel_id, point_indexes)
+            if len(key[2]) == 0:
+                continue
+
+            if sub.over_budget_minutes[pos] > 0:
+                if key not in seen_hard:
+                    seen_hard.add(key)
+                    hard_patterns.append(
+                        HardDayPattern(
+                            calendar_day=calendar_day,
+                            hotel_id=hotel_id,
+                            point_indexes=key[2],
+                        )
+                    )
+                    new_hard += 1
+                continue
+
+            if (
+                req.badDayTransitMinutesThreshold > 0
+                and sub.day_travel_minutes[pos] > req.badDayTransitMinutesThreshold
+                and req.badDayPenaltyMinutes > 0
+            ):
+                if key not in seen_soft:
+                    seen_soft.add(key)
+                    soft_patterns.append(
+                        SoftDayPattern(
+                            calendar_day=calendar_day,
+                            hotel_id=hotel_id,
+                            point_indexes=key[2],
+                            penalty_minutes=req.badDayPenaltyMinutes,
+                        )
+                    )
+                    new_soft += 1
+
+        traces.append(
+            {
+                "iteration": len(traces) + 1,
+                "travelMinutes": total_travel,
+                "overBudgetMinutes": total_over,
+                "hardCutsAdded": new_hard,
+                "softPenaltiesAdded": new_soft,
+            }
+        )
+
+        if new_hard == 0 and new_soft == 0:
+            return master, sub, traces
+
+    if best_pair is None:
+        raise HTTPException(status_code=503, detail="solver failed to find plan")
+    return best_pair[0], best_pair[1], traces
 
 
 @dataclass
@@ -996,6 +1556,48 @@ def assemble_response(
     )
 
 
+def assemble_layered_response(
+    req: SolveRequest,
+    master: MasterResult,
+    sub: SubproblemResult,
+    traces: list[dict[str, int]],
+) -> SolveResponse:
+    start_date = req.arrivalDateTime.date()
+    days: list[DayPlan] = []
+
+    for pos in range(len(master.day_point_indexes)):
+        calendar_index = master.used_calendar_days[pos]
+        point_indexes = master.day_point_indexes[pos]
+        order = sub.orderings[pos]
+        point_ids = [req.points[point_indexes[idx]].id for idx in order]
+
+        days.append(
+            DayPlan(
+                dayNumber=pos + 1,
+                date=(start_date + timedelta(days=calendar_index)).isoformat(),
+                pointIds=point_ids,
+                hotelId=master.hotel_ids[pos],
+            )
+        )
+
+    solver_status: Literal["OPTIMAL", "FEASIBLE"] = master.solver_status
+    if any(value > 0 for value in sub.over_budget_minutes):
+        solver_status = "FEASIBLE"
+
+    return SolveResponse(
+        tripDays=len(days),
+        solverStatus=solver_status,
+        objective=req.objective,
+        days=days,
+        diagnostics={
+            "iterations": traces,
+            "iterationCount": len(traces),
+            "totalTravelMinutes": int(sum(sub.day_travel_minutes)),
+            "totalOverBudgetMinutes": int(sum(sub.over_budget_minutes)),
+        },
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -1007,8 +1609,5 @@ def solve(req: SolveRequest) -> SolveResponse:
 
     audit_matrix_completeness(req, lookup)
 
-    p1 = phase1_assign_days(req, lookup)
-    precomputed = phase2_precompute(req, p1, lookup)
-    p3 = phase3_hotel_dp(req, p1, precomputed, lookup)
-
-    return assemble_response(req, p1, p3, precomputed)
+    master, sub, traces = solve_with_layered_iteration(req, lookup)
+    return assemble_layered_response(req, master, sub, traces)
