@@ -8,16 +8,29 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from ortools.sat.python import cp_model
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field as PydField
 
-
-app = FastAPI(title="Optivoy Optimizer", version="0.1.0")
+app = FastAPI(title="Optivoy Optimizer", version="0.2.3")
 
 PACE_MODE_WINDOWS: dict[str, tuple[str, str, int]] = {
     "light": ("10:00", "18:00", 480),
     "standard": ("09:00", "20:00", 660),
     "compact": ("08:00", "21:00", 780),
 }
+
+HOTEL_SWITCH_PENALTY_MINUTES = 45
+PER_POINT_OVERHEAD_MINUTES = 12
+MAX_EXACT_PERMUTATION_SIZE = 8
+
+MAX_MISSING_UNDIRECTED_RATIO = 0.0
+
+# v0.2.3: Geographic coherence tiebreaker.
+# When two routes have equal transit cost (common with symmetric driving distances),
+# this tiny penalty (in minutes) per geographic direction reversal breaks the tie
+# in favor of routes that flow consistently in one direction (e.g. south→north).
+# 0.01 min = 0.6 seconds — too small to override any real distance difference,
+# but large enough to break ties deterministically.
+GEO_ZIGZAG_PENALTY = 0.01
 
 
 class CoordinateIn(BaseModel):
@@ -26,55 +39,55 @@ class CoordinateIn(BaseModel):
 
 
 class PointIn(BaseModel):
-    id: str = Field(min_length=1, max_length=64)
+    id: str = PydField(min_length=1, max_length=64)
     pointType: Literal["spot", "shopping", "restaurant"]
-    suggestedDurationMinutes: int = Field(ge=10, le=720)
+    suggestedDurationMinutes: int = PydField(ge=10, le=720)
     latitude: float | None = None
     longitude: float | None = None
 
 
 class HotelIn(BaseModel):
-    id: str = Field(min_length=1, max_length=64)
+    id: str = PydField(min_length=1, max_length=64)
     latitude: float | None = None
     longitude: float | None = None
 
 
 class DistanceMatrixRowIn(BaseModel):
-    fromPointId: str = Field(min_length=1, max_length=64)
-    toPointId: str = Field(min_length=1, max_length=64)
-    transitMinutes: int = Field(ge=1, le=1440)
-    drivingMinutes: int = Field(ge=1, le=1440)
-    walkingMeters: int = Field(ge=0, le=200000)
-    distanceKm: float = Field(ge=0, le=2000)
+    fromPointId: str = PydField(min_length=1, max_length=64)
+    toPointId: str = PydField(min_length=1, max_length=64)
+    transitMinutes: int = PydField(ge=1, le=1440)
+    drivingMinutes: int = PydField(ge=1, le=1440)
+    walkingMeters: int = PydField(ge=0, le=200000)
+    distanceKm: float = PydField(ge=0, le=2000)
     transitSummary: str | None = None
 
 
 class DistanceMatrixIn(BaseModel):
-    rows: list[DistanceMatrixRowIn] = Field(default_factory=list, max_length=300000)
+    rows: list[DistanceMatrixRowIn] = PydField(default_factory=list, max_length=300000)
 
 
 class SolveRequest(BaseModel):
-    city: str | None = Field(default=None, min_length=1, max_length=120)
-    province: str | None = Field(default=None, min_length=1, max_length=120)
+    city: str | None = PydField(default=None, min_length=1, max_length=120)
+    province: str | None = PydField(default=None, min_length=1, max_length=120)
     arrivalAirport: CoordinateIn | None = None
     departureAirport: CoordinateIn | None = None
-    arrivalAirportCode: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
-    departureAirportCode: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
-    arrivalAirportId: str | None = Field(default=None, min_length=1, max_length=64)
-    departureAirportId: str | None = Field(default=None, min_length=1, max_length=64)
+    arrivalAirportCode: str | None = PydField(default=None, pattern=r"^[A-Z]{3}$")
+    departureAirportCode: str | None = PydField(default=None, pattern=r"^[A-Z]{3}$")
+    arrivalAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
+    departureAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
     arrivalDateTime: datetime
-    airportBufferMinutes: int = Field(default=90, ge=60, le=120)
-    points: list[PointIn] = Field(min_length=1, max_length=200)
-    hotels: list[HotelIn] = Field(min_length=1, max_length=200)
-    distanceMatrix: DistanceMatrixIn = Field(default_factory=DistanceMatrixIn)
+    airportBufferMinutes: int = PydField(default=90, ge=60, le=120)
+    points: list[PointIn] = PydField(min_length=1, max_length=200)
+    hotels: list[HotelIn] = PydField(min_length=1, max_length=200)
+    distanceMatrix: DistanceMatrixIn = PydField(default_factory=DistanceMatrixIn)
     paceMode: Literal["light", "standard", "compact"] = "standard"
     hotelMode: Literal["single", "multi"] = "multi"
     mealPolicy: Literal["auto", "off"] = "auto"
     objective: Literal["min_days", "min_transit", "min_days_then_transit"] = (
         "min_days_then_transit"
     )
-    maxDays: int = Field(default=14, ge=1, le=14)
-    timeLimitSeconds: float = Field(default=2.5, ge=0.2, le=30.0)
+    maxDays: int = PydField(default=14, ge=1, le=14)
+    timeLimitSeconds: float = PydField(default=2.5, ge=0.2, le=30.0)
 
 
 class DayPlan(BaseModel):
@@ -99,32 +112,48 @@ class Coord:
 
 @dataclass(frozen=True)
 class Anchor:
-    point_id: str | None
+    node_id: str | None
     coord: Coord
 
 
 def haversine_km(a: Coord, b: Coord) -> float:
     if a.lat is None or a.lng is None or b.lat is None or b.lng is None:
         return 8.0
-    to_rad = math.pi / 180.0
-    dlat = (b.lat - a.lat) * to_rad
-    dlng = (b.lng - a.lng) * to_rad
-    aa = (
+    r = math.pi / 180.0
+    dlat = (b.lat - a.lat) * r
+    dlng = (b.lng - a.lng) * r
+    h = (
         math.sin(dlat / 2.0) ** 2
-        + math.cos(a.lat * to_rad)
-        * math.cos(b.lat * to_rad)
-        * math.sin(dlng / 2.0) ** 2
+        + math.cos(a.lat * r) * math.cos(b.lat * r) * math.sin(dlng / 2.0) ** 2
     )
-    return 6371.0 * 2.0 * math.atan2(math.sqrt(aa), math.sqrt(1.0 - aa))
+    return 6371.0 * 2.0 * math.atan2(math.sqrt(h), math.sqrt(1.0 - h))
 
 
-def fallback_transit_minutes(a: Coord, b: Coord) -> int:
+def _fallback_minutes(a: Coord, b: Coord) -> int:
     km = haversine_km(a, b)
-    driving = (km / 25.0) * 60.0
-    return max(8, int(round(driving + 8)))
+    return max(8, int(round(km / 25.0 * 60.0 + 8)))
 
 
-def matrix_transit_minutes(
+def coord_of(p: PointIn | HotelIn) -> Coord:
+    return Coord(p.latitude, p.longitude)
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    h, m = value.split(":", 1)
+    return int(h), int(m)
+
+
+def build_lookup(rows: list[DistanceMatrixRowIn]) -> dict[tuple[str, str], int]:
+    lookup: dict[tuple[str, str], int] = {}
+    for row in rows:
+        key = (row.fromPointId, row.toPointId)
+        current = lookup.get(key)
+        if current is None or row.transitMinutes < current:
+            lookup[key] = row.transitMinutes
+    return lookup
+
+
+def directed(
     from_id: str | None,
     from_coord: Coord,
     to_id: str | None,
@@ -138,187 +167,187 @@ def matrix_transit_minutes(
         reverse = lookup.get((to_id, from_id))
         if reverse is not None and reverse > 0:
             return reverse
-    return fallback_transit_minutes(from_coord, to_coord)
+    return _fallback_minutes(from_coord, to_coord)
 
 
-def route_cost(
-    order: list[int],
-    points: list[PointIn],
-    start: Anchor | None,
+def symmetric(
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
     lookup: dict[tuple[str, str], int],
 ) -> int:
-    total = 0
-    prev = start
-    for idx in order:
-        current_point = points[idx]
-        current_anchor = Anchor(
-            point_id=current_point.id,
-            coord=Coord(current_point.latitude, current_point.longitude),
-        )
-        if prev is not None:
-            total += matrix_transit_minutes(
-                prev.point_id,
-                prev.coord,
-                current_anchor.point_id,
-                current_anchor.coord,
-                lookup,
-            )
-        prev = current_anchor
-    return total
+    if from_id and to_id:
+        direct = lookup.get((from_id, to_id))
+        if direct is not None and direct > 0:
+            return direct
+        reverse = lookup.get((to_id, from_id))
+        if reverse is not None and reverse > 0:
+            return reverse
+    return _fallback_minutes(from_coord, to_coord)
 
 
-def best_day_order(
-    point_indexes: list[int],
-    points: list[PointIn],
-    start: Anchor | None,
-    lookup: dict[tuple[str, str], int],
-) -> list[int]:
-    if len(point_indexes) <= 1:
-        return point_indexes
+# ═══════════════════════════════════════════════════════════
+# v0.2.3: Geographic coherence tiebreaker
+#
+# Problem: driving distances are approximately symmetric (A→B ≈ B→A).
+# A round-trip Hotel→P1→P2→P3→Hotel costs the same as Hotel→P3→P2→P1→Hotel.
+# The optimizer picks one arbitrarily, sometimes producing a "backwards" route.
+#
+# Fix: add a tiny penalty for routes that zigzag geographically.
+# A route that goes consistently south→north gets 0 penalty.
+# A route that goes south→north→south gets 0.01 min penalty per reversal.
+# This breaks ties deterministically without affecting routes where
+# distance differences are real (even 1 minute > any number of reversals).
+# ═══════════════════════════════════════════════════════════
 
-    # Day size is usually small; brute force gives exact best order.
-    if len(point_indexes) <= 8:
-        best = point_indexes
-        best_cost = None
-        for perm in itertools.permutations(point_indexes):
-            cost = route_cost(list(perm), points, start, lookup)
-            if best_cost is None or cost < best_cost:
-                best_cost = cost
-                best = list(perm)
-        return best
+def _geo_zigzag_penalty(coords: list[Coord]) -> float:
+    """Count geographic direction reversals in a sequence of coordinates.
 
-    # Fallback heuristic for larger day sets.
-    remaining = set(point_indexes)
-    ordered: list[int] = []
+    A reversal occurs when the latitude direction or longitude direction
+    flips between consecutive legs.  Each reversal adds GEO_ZIGZAG_PENALTY.
 
-    if start is None:
-        first = min(
-            remaining,
-            key=lambda idx: sum(
-                matrix_transit_minutes(
-                    points[idx].id,
-                    Coord(points[idx].latitude, points[idx].longitude),
-                    points[j].id,
-                    Coord(points[j].latitude, points[j].longitude),
-                    lookup,
-                )
-                for j in remaining
-                if j != idx
-            ),
-        )
-    else:
-        first = min(
-            remaining,
-            key=lambda idx: matrix_transit_minutes(
-                start.point_id,
-                start.coord,
-                points[idx].id,
-                Coord(points[idx].latitude, points[idx].longitude),
-                lookup,
-            ),
-        )
+    For the Hotel(N)→天安门(S)→故宫(M)→景山(N)→Hotel(N) route:
+      Leg 1: N→S (south)
+      Leg 2: S→M (north)  ← lat reversal
+      Leg 3: M→N (north)  ← consistent
+      Leg 4: N→N (north)  ← consistent
+      Total: 1 reversal → 0.01 penalty
 
-    ordered.append(first)
-    remaining.remove(first)
-    current = Anchor(
-        point_id=points[first].id,
-        coord=Coord(points[first].latitude, points[first].longitude),
+    For the Hotel(N)→景山(N)→故宫(M)→天安门(S)→Hotel(N) route:
+      Leg 1: N→N (flat/south)
+      Leg 2: N→M (south)  ← consistent
+      Leg 3: M→S (south)  ← consistent
+      Leg 4: S→N (north)  ← lat reversal
+      Total: 1 reversal → 0.01 penalty
+
+    Wait — both have 1 reversal? That's because the Hotel is north of all points.
+    The correct route starts by going south (to the farthest point), then comes back north.
+    The wrong route starts by going to the nearest, then goes further south, then has to come all the way back.
+
+    For a linear layout (Hotel-景山-故宫-天安门, north to south), the optimal pattern is:
+    go to the far end first, then come back step by step.
+
+    So we also penalize the total geographic spread of direction changes:
+    instead of just counting reversals, we weight by the magnitude of the reversal.
+    """
+    if len(coords) < 3:
+        return 0.0
+
+    penalty = 0.0
+    for i in range(1, len(coords) - 1):
+        prev_c = coords[i - 1]
+        curr_c = coords[i]
+        next_c = coords[i + 1]
+
+        if (
+            prev_c.lat is None or curr_c.lat is None or next_c.lat is None
+            or prev_c.lng is None or curr_c.lng is None or next_c.lng is None
+        ):
+            continue
+
+        dlat_in = curr_c.lat - prev_c.lat
+        dlat_out = next_c.lat - curr_c.lat
+        dlng_in = curr_c.lng - prev_c.lng
+        dlng_out = next_c.lng - curr_c.lng
+
+        # Penalize latitude reversal (going north then south, or vice versa)
+        if dlat_in * dlat_out < 0:
+            penalty += GEO_ZIGZAG_PENALTY
+
+        # Penalize longitude reversal
+        if dlng_in * dlng_out < 0:
+            penalty += GEO_ZIGZAG_PENALTY
+
+    return penalty
+
+
+def _route_geo_penalty(
+    start_coord: Coord,
+    day_points: list[PointIn],
+    ordering: list[int],
+    end_coord: Coord,
+) -> float:
+    """Compute geographic zigzag penalty for a full route: start → points → end."""
+    coords: list[Coord] = [start_coord]
+    for idx in ordering:
+        coords.append(coord_of(day_points[idx]))
+    coords.append(end_coord)
+    return _geo_zigzag_penalty(coords)
+
+
+def _arrival_anchor(req: SolveRequest) -> Anchor | None:
+    if req.arrivalAirport is None:
+        return None
+    return Anchor(
+        req.arrivalAirportId or "__arrival_airport__",
+        Coord(req.arrivalAirport.latitude, req.arrivalAirport.longitude),
     )
 
-    while remaining:
-        next_idx = min(
-            remaining,
-            key=lambda idx: matrix_transit_minutes(
-                current.point_id,
-                current.coord,
-                points[idx].id,
-                Coord(points[idx].latitude, points[idx].longitude),
-                lookup,
+
+def _departure_anchor(req: SolveRequest) -> Anchor | None:
+    if req.departureAirport is None:
+        return None
+    return Anchor(
+        req.departureAirportId or "__departure_airport__",
+        Coord(req.departureAirport.latitude, req.departureAirport.longitude),
+    )
+
+
+def audit_matrix_completeness(
+    req: SolveRequest,
+    lookup: dict[tuple[str, str], int],
+) -> None:
+    node_ids: list[str] = []
+    node_ids.extend(p.id for p in req.points)
+    node_ids.extend(h.id for h in req.hotels)
+
+    arrival = _arrival_anchor(req)
+    departure = _departure_anchor(req)
+    if arrival and arrival.node_id:
+        node_ids.append(arrival.node_id)
+    if departure and departure.node_id and departure.node_id != (
+        arrival.node_id if arrival else None
+    ):
+        node_ids.append(departure.node_id)
+
+    unique_ids = list(dict.fromkeys(node_ids))
+    n = len(unique_ids)
+    if n <= 1:
+        return
+
+    total_pairs = 0
+    present_pairs = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            total_pairs += 1
+            a = unique_ids[i]
+            b = unique_ids[j]
+            if (a, b) in lookup or (b, a) in lookup:
+                present_pairs += 1
+
+    if total_pairs == 0:
+        return
+
+    missing_ratio = 1.0 - (present_pairs / total_pairs)
+    if missing_ratio > MAX_MISSING_UNDIRECTED_RATIO:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Distance matrix incomplete (undirected): {present_pairs}/{total_pairs} pairs present "
+                f"({missing_ratio:.1%} missing, threshold {MAX_MISSING_UNDIRECTED_RATIO:.0%})."
             ),
         )
-        ordered.append(next_idx)
-        remaining.remove(next_idx)
-        current = Anchor(
-            point_id=points[next_idx].id,
-            coord=Coord(points[next_idx].latitude, points[next_idx].longitude),
-        )
-
-    return ordered
 
 
-def choose_single_hotel(
-    hotels: list[HotelIn],
-    points: list[PointIn],
-    lookup: dict[tuple[str, str], int],
-) -> str:
-    all_indexes = list(range(len(points)))
-    return choose_day_hotel(hotels, points, all_indexes, None, None, lookup)
+@dataclass
+class Phase1Result:
+    day_point_indexes: list[list[int]]
+    used_calendar_days: list[int]
+    solver_status: Literal["OPTIMAL", "FEASIBLE"]
 
 
-def choose_day_hotel(
-    hotels: list[HotelIn],
-    points: list[PointIn],
-    day_indexes: list[int],
-    start_anchor: Anchor | None,
-    next_day_first_anchor: Anchor | None,
-    lookup: dict[tuple[str, str], int],
-) -> str:
-    if not day_indexes:
-        return hotels[0].id
-
-    best_id = hotels[0].id
-    best_cost = None
-    for hotel in hotels:
-        hotel_anchor = Anchor(hotel.id, Coord(hotel.latitude, hotel.longitude))
-        first_point = points[day_indexes[0]]
-        last_point = points[day_indexes[-1]]
-
-        cost = matrix_transit_minutes(
-            last_point.id,
-            Coord(last_point.latitude, last_point.longitude),
-            hotel_anchor.point_id,
-            hotel_anchor.coord,
-            lookup,
-        )
-
-        if next_day_first_anchor is not None:
-            cost += matrix_transit_minutes(
-                hotel_anchor.point_id,
-                hotel_anchor.coord,
-                next_day_first_anchor.point_id,
-                next_day_first_anchor.coord,
-                lookup,
-            )
-
-        if start_anchor is not None:
-            cost += matrix_transit_minutes(
-                start_anchor.point_id,
-                start_anchor.coord,
-                first_point.id,
-                Coord(first_point.latitude, first_point.longitude),
-                lookup,
-            )
-
-        if best_cost is None or cost < best_cost:
-            best_cost = cost
-            best_id = hotel.id
-    return best_id
-
-
-def coord_from_point(point: PointIn) -> Coord:
-    return Coord(point.latitude, point.longitude)
-
-
-def coord_from_hotel(hotel: HotelIn) -> Coord:
-    return Coord(hotel.latitude, hotel.longitude)
-
-
-def parse_hhmm(value: str) -> tuple[int, int]:
-    hour_str, minute_str = value.split(":", 1)
-    return int(hour_str), int(minute_str)
-
-
-def first_day_budget_minutes(
+def _first_day_budget(
     arrival_dt: datetime,
     buffer_minutes: int,
     pace_start: str,
@@ -326,41 +355,645 @@ def first_day_budget_minutes(
     pace_minutes: int,
     meal_overhead: int,
 ) -> int:
-    start_hour, start_minute = parse_hhmm(pace_start)
-    end_hour, end_minute = parse_hhmm(pace_end)
+    sh, sm = _parse_hhmm(pace_start)
+    eh, em = _parse_hhmm(pace_end)
+    start_dt = arrival_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_dt = arrival_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
 
-    pace_start_dt = arrival_dt.replace(
-        hour=start_hour,
-        minute=start_minute,
-        second=0,
-        microsecond=0,
-    )
-    pace_end_dt = arrival_dt.replace(
-        hour=end_hour,
-        minute=end_minute,
-        second=0,
-        microsecond=0,
-    )
-
-    arrival_with_buffer = arrival_dt + timedelta(minutes=buffer_minutes)
-    usable_start = max(arrival_with_buffer, pace_start_dt)
-    raw_usable = int((pace_end_dt - usable_start).total_seconds() // 60)
-
-    if raw_usable <= 0:
+    usable_start = max(arrival_dt + timedelta(minutes=buffer_minutes), start_dt)
+    raw = int((end_dt - usable_start).total_seconds() // 60)
+    if raw <= 0:
         return 0
 
-    clipped = min(raw_usable, pace_minutes)
+    clipped = min(raw, pace_minutes)
     return max(0, clipped - meal_overhead)
 
 
-def build_transit_lookup(rows: list[DistanceMatrixRowIn]) -> dict[tuple[str, str], int]:
-    lookup: dict[tuple[str, str], int] = {}
-    for row in rows:
-        key = (row.fromPointId, row.toPointId)
-        current = lookup.get(key)
-        if current is None or row.transitMinutes < current:
-            lookup[key] = row.transitMinutes
-    return lookup
+def phase1_assign_days(
+    req: SolveRequest, lookup: dict[tuple[str, str], int]
+) -> Phase1Result:
+    pace_start, pace_end, pace_minutes = PACE_MODE_WINDOWS[req.paceMode]
+    has_restaurant = any(p.pointType == "restaurant" for p in req.points)
+    meal_overhead = 45 if req.mealPolicy == "auto" and not has_restaurant else 0
+
+    daily_budget = pace_minutes - meal_overhead
+    if daily_budget < 120:
+        raise HTTPException(status_code=400, detail="daily playable minutes too low")
+
+    first_day_budget = _first_day_budget(
+        req.arrivalDateTime,
+        req.airportBufferMinutes,
+        pace_start,
+        pace_end,
+        pace_minutes,
+        meal_overhead,
+    )
+
+    point_loads = [
+        p.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES for p in req.points
+    ]
+    if any(load > daily_budget for load in point_loads):
+        raise HTTPException(
+            status_code=400,
+            detail="at least one point duration exceeds daily budget",
+        )
+
+    n = len(req.points)
+    d = min(n + 1, req.maxDays + 1)
+
+    model = cp_model.CpModel()
+
+    x = [[model.NewBoolVar(f"x_{i}_{day}") for day in range(d)] for i in range(n)]
+    for i in range(n):
+        model.Add(sum(x[i]) == 1)
+
+    day_budgets = [daily_budget for _ in range(d)]
+    day_budgets[0] = first_day_budget
+
+    used = [model.NewBoolVar(f"u_{day}") for day in range(d)]
+    for day in range(d):
+        model.Add(
+            sum(point_loads[i] * x[i][day] for i in range(n))
+            <= day_budgets[day] * used[day]
+        )
+        model.Add(sum(x[i][day] for i in range(n)) >= used[day])
+
+    for day in range(1, d - 1):
+        model.Add(used[day] >= used[day + 1])
+
+    model.Add(sum(used) <= req.maxDays)
+
+    used_days_expr = sum(used)
+    day_pack_penalty = sum(
+        (day + 1) * x[i][day] for i in range(n) for day in range(d)
+    )
+
+    pair_terms: list[cp_model.LinearExpr] = []
+    if req.objective in ("min_transit", "min_days_then_transit") and n <= 60:
+        for i in range(n):
+            for j in range(i + 1, n):
+                cost = symmetric(
+                    req.points[i].id,
+                    coord_of(req.points[i]),
+                    req.points[j].id,
+                    coord_of(req.points[j]),
+                    lookup,
+                )
+                for day in range(d):
+                    y = model.NewBoolVar(f"pair_{i}_{j}_{day}")
+                    model.Add(y <= x[i][day])
+                    model.Add(y <= x[j][day])
+                    model.Add(y >= x[i][day] + x[j][day] - 1)
+                    pair_terms.append(y * cost)
+    transit_proxy_penalty = sum(pair_terms)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = 8
+
+    phase1_time = max(0.2, req.timeLimitSeconds * 0.4)
+    phase2_time = max(0.2, req.timeLimitSeconds * 0.5)
+
+    lex_first_status: int | None = None
+
+    if req.objective == "min_days":
+        solver.parameters.max_time_in_seconds = phase1_time + phase2_time
+        model.Minimize(used_days_expr * 10000 + day_pack_penalty)
+        status = solver.Solve(model)
+    elif req.objective == "min_transit":
+        solver.parameters.max_time_in_seconds = phase1_time + phase2_time
+        model.Minimize(
+            used_days_expr * 10000 + transit_proxy_penalty + day_pack_penalty
+        )
+        status = solver.Solve(model)
+    else:
+        solver.parameters.max_time_in_seconds = phase1_time
+        model.Minimize(used_days_expr)
+        lex_first_status = solver.Solve(model)
+        if lex_first_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise HTTPException(
+                status_code=503, detail="solver failed to find feasible plan"
+            )
+
+        min_days_found = sum(solver.Value(day_used) for day_used in used)
+        if lex_first_status == cp_model.OPTIMAL:
+            model.Add(used_days_expr == min_days_found)
+            model.Minimize(transit_proxy_penalty + day_pack_penalty)
+        else:
+            model.Add(used_days_expr <= min_days_found)
+            model.Minimize(
+                used_days_expr * 10000 + transit_proxy_penalty + day_pack_penalty
+            )
+
+        solver.parameters.max_time_in_seconds = phase2_time
+        status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise HTTPException(
+            status_code=503, detail="solver failed to find feasible plan"
+        )
+
+    used_day_indexes = [day for day in range(d) if solver.Value(used[day]) == 1]
+    if not used_day_indexes:
+        raise HTTPException(
+            status_code=503, detail="solver returned empty day set"
+        )
+
+    day_position_by_index = {
+        day_idx: pos for pos, day_idx in enumerate(used_day_indexes)
+    }
+    day_indexes: list[list[int]] = [[] for _ in range(len(used_day_indexes))]
+
+    for i in range(n):
+        assigned_day = None
+        for day in range(d):
+            if solver.Value(x[i][day]) == 1:
+                assigned_day = day
+                break
+        if assigned_day is None:
+            raise HTTPException(
+                status_code=503, detail="solver assignment is invalid"
+            )
+        pos = day_position_by_index.get(assigned_day)
+        if pos is None:
+            raise HTTPException(
+                status_code=503, detail="solver used-day mapping is invalid"
+            )
+        day_indexes[pos].append(i)
+
+    solver_status: Literal["OPTIMAL", "FEASIBLE"] = "OPTIMAL"
+    if status != cp_model.OPTIMAL:
+        solver_status = "FEASIBLE"
+    if (
+        req.objective == "min_days_then_transit"
+        and lex_first_status == cp_model.FEASIBLE
+    ):
+        solver_status = "FEASIBLE"
+
+    return Phase1Result(
+        day_point_indexes=day_indexes,
+        used_calendar_days=used_day_indexes,
+        solver_status=solver_status,
+    )
+
+
+@dataclass
+class DayRoute:
+    ordering: list[int]
+    cost: int
+    effective_cost: float  # cost + geo penalty (for comparison only)
+
+
+@dataclass
+class DayPrecomputed:
+    points: list[PointIn]
+    global_indexes: list[int]
+    routes: dict[tuple[str, str], DayRoute]
+
+
+def _nn_order(
+    day_points: list[PointIn],
+    start_id: str,
+    start_coord: Coord,
+    end_hotel_id: str,
+    end_hotel_coord: Coord,
+    lookup: dict[tuple[str, str], int],
+) -> DayRoute:
+    m = len(day_points)
+    if m == 0:
+        c = directed(start_id, start_coord, end_hotel_id, end_hotel_coord, lookup)
+        return DayRoute([], c, float(c))
+
+    remaining = set(range(m))
+    ordering: list[int] = []
+
+    first = min(
+        remaining,
+        key=lambda i: directed(
+            start_id, start_coord, day_points[i].id, coord_of(day_points[i]), lookup
+        ),
+    )
+    ordering.append(first)
+    remaining.remove(first)
+
+    while remaining:
+        current_point = day_points[ordering[-1]]
+        next_idx = min(
+            remaining,
+            key=lambda i: directed(
+                current_point.id,
+                coord_of(current_point),
+                day_points[i].id,
+                coord_of(day_points[i]),
+                lookup,
+            ),
+        )
+        ordering.append(next_idx)
+        remaining.remove(next_idx)
+
+    cost = directed(
+        start_id,
+        start_coord,
+        day_points[ordering[0]].id,
+        coord_of(day_points[ordering[0]]),
+        lookup,
+    )
+    for k in range(m - 1):
+        a = day_points[ordering[k]]
+        b = day_points[ordering[k + 1]]
+        cost += directed(a.id, coord_of(a), b.id, coord_of(b), lookup)
+    cost += directed(
+        day_points[ordering[-1]].id,
+        coord_of(day_points[ordering[-1]]),
+        end_hotel_id,
+        end_hotel_coord,
+        lookup,
+    )
+
+    geo_pen = _route_geo_penalty(start_coord, day_points, ordering, end_hotel_coord)
+    return DayRoute(ordering, cost, cost + geo_pen)
+
+
+def _precompute_day_exact(
+    day_points: list[PointIn],
+    start_ids: list[str],
+    hotels: list[HotelIn],
+    coord_map: dict[str, Coord],
+    lookup: dict[tuple[str, str], int],
+) -> dict[tuple[str, str], DayRoute]:
+    m = len(day_points)
+    routes: dict[tuple[str, str], DayRoute] = {}
+
+    if m == 0:
+        for start_id in start_ids:
+            start_coord = coord_map[start_id]
+            for hotel in hotels:
+                c = directed(start_id, start_coord, hotel.id, coord_of(hotel), lookup)
+                routes[(start_id, hotel.id)] = DayRoute([], c, float(c))
+        return routes
+
+    if m == 1:
+        only = day_points[0]
+        for start_id in start_ids:
+            start_coord = coord_map[start_id]
+            for hotel in hotels:
+                in_cost = directed(
+                    start_id, start_coord, only.id, coord_of(only), lookup
+                )
+                out_cost = directed(
+                    only.id, coord_of(only), hotel.id, coord_of(hotel), lookup
+                )
+                c = in_cost + out_cost
+                routes[(start_id, hotel.id)] = DayRoute([0], c, float(c))
+        return routes
+
+    # Step A: enumerate permutations, group by (first, last), keep cheapest inner
+    best_inner: dict[tuple[int, int], tuple[int, list[int]]] = {}
+
+    for perm in itertools.permutations(range(m)):
+        order = list(perm)
+        first_idx = order[0]
+        last_idx = order[-1]
+
+        inner_cost = 0
+        for k in range(m - 1):
+            a = day_points[order[k]]
+            b = day_points[order[k + 1]]
+            inner_cost += directed(a.id, coord_of(a), b.id, coord_of(b), lookup)
+
+        key = (first_idx, last_idx)
+        current = best_inner.get(key)
+        if current is None or inner_cost < current[0]:
+            best_inner[key] = (inner_cost, order)
+
+    # Step B: precompute edge tables
+    start_to_first: dict[tuple[str, int], int] = {}
+    for start_id in start_ids:
+        start_coord = coord_map[start_id]
+        for point_idx in range(m):
+            point = day_points[point_idx]
+            start_to_first[(start_id, point_idx)] = directed(
+                start_id, start_coord, point.id, coord_of(point), lookup
+            )
+
+    last_to_hotel: dict[tuple[int, str], int] = {}
+    for point_idx in range(m):
+        point = day_points[point_idx]
+        for hotel in hotels:
+            last_to_hotel[(point_idx, hotel.id)] = directed(
+                point.id, coord_of(point), hotel.id, coord_of(hotel), lookup
+            )
+
+    # Step C: for each (start, hotel), find best route using effective_cost (with geo penalty)
+    grouped = list(best_inner.items())
+
+    for start_id in start_ids:
+        start_coord = coord_map[start_id]
+        for hotel in hotels:
+            hotel_coord = coord_of(hotel)
+            best_eff: float | None = None
+            best_cost: int = 0
+            best_perm: list[int] = grouped[0][1][1]
+
+            for (first_idx, last_idx), (inner_cost, perm) in grouped:
+                transit_cost = (
+                    start_to_first[(start_id, first_idx)]
+                    + inner_cost
+                    + last_to_hotel[(last_idx, hotel.id)]
+                )
+                # v0.2.3: add geographic coherence penalty for tiebreaking
+                geo_pen = _route_geo_penalty(
+                    start_coord, day_points, perm, hotel_coord
+                )
+                eff = transit_cost + geo_pen
+
+                if best_eff is None or eff < best_eff:
+                    best_eff = eff
+                    best_cost = transit_cost
+                    best_perm = perm
+
+            routes[(start_id, hotel.id)] = DayRoute(
+                list(best_perm), best_cost, best_eff or float(best_cost)
+            )
+
+    return routes
+
+
+def phase2_precompute(
+    req: SolveRequest,
+    p1: Phase1Result,
+    lookup: dict[tuple[str, str], int],
+) -> list[DayPrecomputed]:
+    arrival = _arrival_anchor(req)
+    has_rest_day_before_tour = p1.used_calendar_days[0] > 0
+
+    hotel_ids = [h.id for h in req.hotels]
+    coord_map: dict[str, Coord] = {h.id: coord_of(h) for h in req.hotels}
+
+    if arrival and arrival.node_id:
+        coord_map[arrival.node_id] = arrival.coord
+
+    results: list[DayPrecomputed] = []
+
+    for pos, point_indexes in enumerate(p1.day_point_indexes):
+        day_points = [req.points[i] for i in point_indexes]
+
+        if pos == 0:
+            if has_rest_day_before_tour:
+                start_ids = list(hotel_ids)
+            elif arrival and arrival.node_id:
+                start_ids = [arrival.node_id]
+            else:
+                start_ids = list(hotel_ids)
+        else:
+            start_ids = list(hotel_ids)
+
+        if len(day_points) <= MAX_EXACT_PERMUTATION_SIZE:
+            routes = _precompute_day_exact(
+                day_points, start_ids, req.hotels, coord_map, lookup
+            )
+        else:
+            routes = {}
+            for start_id in start_ids:
+                start_coord = coord_map[start_id]
+                for hotel in req.hotels:
+                    routes[(start_id, hotel.id)] = _nn_order(
+                        day_points,
+                        start_id,
+                        start_coord,
+                        hotel.id,
+                        coord_of(hotel),
+                        lookup,
+                    )
+
+        results.append(
+            DayPrecomputed(
+                points=day_points,
+                global_indexes=list(point_indexes),
+                routes=routes,
+            )
+        )
+
+    return results
+
+
+def _max_switches(trip_days: int) -> int:
+    if trip_days <= 3:
+        return 0
+    if trip_days <= 5:
+        return 1
+    if trip_days <= 7:
+        return 2
+    return 3
+
+
+@dataclass
+class Phase3Result:
+    hotel_ids: list[str]
+    orderings: list[list[int]]
+    total_cost: int
+    arrival_hotel_id: str | None
+
+
+def phase3_hotel_dp(
+    req: SolveRequest,
+    p1: Phase1Result,
+    precomputed: list[DayPrecomputed],
+    lookup: dict[tuple[str, str], int],
+) -> Phase3Result:
+    num_days = len(precomputed)
+    hotels = req.hotels
+    hotel_count = len(hotels)
+
+    if num_days == 0:
+        return Phase3Result([], [], 0, None)
+
+    max_switches = 0 if req.hotelMode == "single" else _max_switches(num_days)
+    inf = 10**9
+
+    has_rest_day_before_tour = p1.used_calendar_days[0] > 0
+    arrival = _arrival_anchor(req)
+    departure = _departure_anchor(req)
+
+    dp = [
+        [[inf] * (max_switches + 1) for _ in range(hotel_count)]
+        for _ in range(num_days)
+    ]
+    back = [
+        [[(-1, -1)] * (max_switches + 1) for _ in range(hotel_count)]
+        for _ in range(num_days)
+    ]
+    arrival_hotel_for = [
+        [[-1] * (max_switches + 1) for _ in range(hotel_count)]
+        for _ in range(num_days)
+    ]
+
+    for h_idx in range(hotel_count):
+        h = hotels[h_idx]
+
+        if has_rest_day_before_tour and arrival and arrival.node_id:
+            for ah_idx in range(hotel_count):
+                ah = hotels[ah_idx]
+                arrival_cost = directed(
+                    arrival.node_id, arrival.coord, ah.id, coord_of(ah), lookup
+                )
+                is_switch = int(ah_idx != h_idx)
+                if is_switch > max_switches:
+                    continue
+                route = precomputed[0].routes.get((ah.id, h.id))
+                if route is None:
+                    continue
+                total = (
+                    arrival_cost
+                    + route.cost
+                    + HOTEL_SWITCH_PENALTY_MINUTES * is_switch
+                )
+                if total < dp[0][h_idx][is_switch]:
+                    dp[0][h_idx][is_switch] = total
+                    back[0][h_idx][is_switch] = (ah_idx, -1)
+                    arrival_hotel_for[0][h_idx][is_switch] = ah_idx
+        elif arrival and arrival.node_id:
+            route = precomputed[0].routes.get((arrival.node_id, h.id))
+            if route is None:
+                continue
+            dp[0][h_idx][0] = route.cost
+            arrival_hotel_for[0][h_idx][0] = h_idx
+        else:
+            route = precomputed[0].routes.get((h.id, h.id))
+            if route is None:
+                continue
+            dp[0][h_idx][0] = route.cost
+            arrival_hotel_for[0][h_idx][0] = h_idx
+
+    for day in range(1, num_days):
+        for h_idx in range(hotel_count):
+            h = hotels[h_idx]
+            for prev_h_idx in range(hotel_count):
+                prev_h = hotels[prev_h_idx]
+                is_switch = int(prev_h_idx != h_idx)
+                for prev_switch_count in range(max_switches + 1):
+                    new_switch_count = prev_switch_count + is_switch
+                    if new_switch_count > max_switches:
+                        continue
+                    prev_cost = dp[day - 1][prev_h_idx][prev_switch_count]
+                    if prev_cost >= inf:
+                        continue
+
+                    route = precomputed[day].routes.get((prev_h.id, h.id))
+                    if route is None:
+                        continue
+
+                    total = (
+                        prev_cost
+                        + route.cost
+                        + HOTEL_SWITCH_PENALTY_MINUTES * is_switch
+                    )
+                    if total < dp[day][h_idx][new_switch_count]:
+                        dp[day][h_idx][new_switch_count] = total
+                        back[day][h_idx][new_switch_count] = (
+                            prev_h_idx,
+                            prev_switch_count,
+                        )
+                        arrival_hotel_for[day][h_idx][new_switch_count] = (
+                            arrival_hotel_for[day - 1][prev_h_idx][prev_switch_count]
+                        )
+
+    if departure and departure.node_id:
+        for h_idx in range(hotel_count):
+            h = hotels[h_idx]
+            airport_cost = directed(
+                h.id, coord_of(h), departure.node_id, departure.coord, lookup
+            )
+            for switch_count in range(max_switches + 1):
+                if dp[num_days - 1][h_idx][switch_count] < inf:
+                    dp[num_days - 1][h_idx][switch_count] += airport_cost
+
+    best_cost = inf
+    best_h_idx = 0
+    best_switch_count = 0
+    for h_idx in range(hotel_count):
+        for switch_count in range(max_switches + 1):
+            cost = dp[num_days - 1][h_idx][switch_count]
+            if cost < best_cost:
+                best_cost = cost
+                best_h_idx = h_idx
+                best_switch_count = switch_count
+
+    if best_cost >= inf:
+        raise HTTPException(
+            status_code=503, detail="no feasible hotel assignment found"
+        )
+
+    h_path = [0] * num_days
+    s_path = [0] * num_days
+    h_path[-1] = best_h_idx
+    s_path[-1] = best_switch_count
+
+    for day in range(num_days - 1, 0, -1):
+        prev_h_idx, prev_switch_count = back[day][h_path[day]][s_path[day]]
+        h_path[day - 1] = prev_h_idx
+        s_path[day - 1] = prev_switch_count
+
+    hotel_ids = [hotels[h_idx].id for h_idx in h_path]
+
+    arr_h_idx = arrival_hotel_for[0][h_path[0]][s_path[0]]
+    arrival_hotel_id = (
+        hotels[arr_h_idx].id if 0 <= arr_h_idx < hotel_count else None
+    )
+
+    orderings: list[list[int]] = []
+    for day in range(num_days):
+        if day == 0:
+            if has_rest_day_before_tour and arrival_hotel_id:
+                start_key = arrival_hotel_id
+            elif arrival and arrival.node_id:
+                start_key = arrival.node_id
+            else:
+                start_key = hotel_ids[0]
+        else:
+            start_key = hotel_ids[day - 1]
+
+        route = precomputed[day].routes.get((start_key, hotel_ids[day]))
+        if route is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"route reconstruction failed at day={day + 1}",
+            )
+        orderings.append(route.ordering)
+
+    return Phase3Result(hotel_ids, orderings, best_cost, arrival_hotel_id)
+
+
+def assemble_response(
+    req: SolveRequest,
+    p1: Phase1Result,
+    p3: Phase3Result,
+    precomputed: list[DayPrecomputed],
+) -> SolveResponse:
+    start_date = req.arrivalDateTime.date()
+    days: list[DayPlan] = []
+
+    for pos in range(len(p1.day_point_indexes)):
+        calendar_index = p1.used_calendar_days[pos]
+        day_pre = precomputed[pos]
+        order = p3.orderings[pos]
+
+        point_ids = [req.points[day_pre.global_indexes[idx]].id for idx in order]
+
+        days.append(
+            DayPlan(
+                dayNumber=pos + 1,
+                date=(start_date + timedelta(days=calendar_index)).isoformat(),
+                pointIds=point_ids,
+                hotelId=p3.hotel_ids[pos],
+            )
+        )
+
+    return SolveResponse(
+        tripDays=len(days),
+        solverStatus=p1.solver_status,
+        objective=req.objective,
+        days=days,
+    )
 
 
 @app.get("/health")
@@ -369,223 +1002,13 @@ def health() -> dict[str, str]:
 
 
 @app.post("/solve", response_model=SolveResponse)
-def solve(input_data: SolveRequest) -> SolveResponse:
-    pace_start, pace_end, pace_minutes = PACE_MODE_WINDOWS[input_data.paceMode]
-    has_restaurant_point = any(p.pointType == "restaurant" for p in input_data.points)
-    meal_overhead = 45 if input_data.mealPolicy == "auto" and not has_restaurant_point else 0
-    daily_budget = pace_minutes - meal_overhead
-    if daily_budget < 120:
-        raise HTTPException(status_code=400, detail="daily playable minutes too low")
+def solve(req: SolveRequest) -> SolveResponse:
+    lookup = build_lookup(req.distanceMatrix.rows)
 
-    first_day_budget = first_day_budget_minutes(
-        input_data.arrivalDateTime,
-        input_data.airportBufferMinutes,
-        pace_start,
-        pace_end,
-        pace_minutes,
-        meal_overhead,
-    )
+    audit_matrix_completeness(req, lookup)
 
-    point_loads = [p.suggestedDurationMinutes + 12 for p in input_data.points]
-    if any(load > daily_budget for load in point_loads):
-        raise HTTPException(
-            status_code=400,
-            detail="at least one point duration exceeds daily budget",
-        )
+    p1 = phase1_assign_days(req, lookup)
+    precomputed = phase2_precompute(req, p1, lookup)
+    p3 = phase3_hotel_dp(req, p1, precomputed, lookup)
 
-    model = cp_model.CpModel()
-    n = len(input_data.points)
-
-    # Add one optional calendar day slot to absorb arrival-day buffer impact.
-    d = min(len(input_data.points) + 1, input_data.maxDays + 1)
-
-    x: list[list[cp_model.IntVar]] = []
-    for i in range(n):
-        row = [model.NewBoolVar(f"x_{i}_{day}") for day in range(d)]
-        x.append(row)
-        model.Add(sum(row) == 1)
-
-    day_budgets = [daily_budget for _ in range(d)]
-    day_budgets[0] = first_day_budget
-
-    used = [model.NewBoolVar(f"used_{day}") for day in range(d)]
-    for day in range(d):
-        model.Add(
-            sum(point_loads[i] * x[i][day] for i in range(n)) <= day_budgets[day] * used[day]
-        )
-        model.Add(sum(x[i][day] for i in range(n)) >= used[day])
-
-    # day0 can be rest day; day1+ must stay contiguous.
-    for day in range(1, d - 1):
-        model.Add(used[day] >= used[day + 1])
-
-    model.Add(sum(used) <= input_data.maxDays)
-
-    transit_lookup = build_transit_lookup(input_data.distanceMatrix.rows)
-
-    used_days_expr = sum(used)
-    day_pack_penalty = sum((day + 1) * x[i][day] for i in range(n) for day in range(d))
-
-    # Encourage geographically compact daily clusters using cached transit matrix.
-    pair_weight_terms: list[cp_model.LinearExpr] = []
-    if input_data.objective in ("min_transit", "min_days_then_transit") and n <= 60:
-        for i in range(n):
-            for j in range(i + 1, n):
-                pair_cost = matrix_transit_minutes(
-                    input_data.points[i].id,
-                    coord_from_point(input_data.points[i]),
-                    input_data.points[j].id,
-                    coord_from_point(input_data.points[j]),
-                    transit_lookup,
-                )
-                for day in range(d):
-                    y = model.NewBoolVar(f"pair_{i}_{j}_{day}")
-                    model.Add(y <= x[i][day])
-                    model.Add(y <= x[j][day])
-                    model.Add(y >= x[i][day] + x[j][day] - 1)
-                    pair_weight_terms.append(y * pair_cost)
-    transit_proxy_penalty = sum(pair_weight_terms)
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = input_data.timeLimitSeconds
-    solver.parameters.num_search_workers = 8
-
-    lexicographic_first_phase_status: int | None = None
-    if input_data.objective == "min_days":
-        model.Minimize(used_days_expr * 10000 + day_pack_penalty)
-        status = solver.Solve(model)
-    elif input_data.objective == "min_transit":
-        model.Minimize(used_days_expr * 10000 + transit_proxy_penalty + day_pack_penalty)
-        status = solver.Solve(model)
-    else:
-        # Lexicographic:
-        # phase-1 minimize trip days, phase-2 fix minimum days and minimize transit proxy.
-        model.Minimize(used_days_expr)
-        lexicographic_first_phase_status = solver.Solve(model)
-        if lexicographic_first_phase_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise HTTPException(status_code=503, detail="solver failed to find feasible plan")
-
-        minimum_days = sum(solver.Value(day_used) for day_used in used)
-        model.Add(used_days_expr == minimum_days)
-        model.Minimize(transit_proxy_penalty + day_pack_penalty)
-        status = solver.Solve(model)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise HTTPException(status_code=503, detail="solver failed to find feasible plan")
-
-    used_day_indexes = [day for day in range(d) if solver.Value(used[day]) == 1]
-    used_days = len(used_day_indexes)
-    if used_days == 0:
-        raise HTTPException(status_code=503, detail="solver returned empty day set")
-
-    day_indexes: list[list[int]] = [[] for _ in range(used_days)]
-    day_position_by_index = {day_idx: pos for pos, day_idx in enumerate(used_day_indexes)}
-    for i in range(n):
-        assigned_day = None
-        for day in range(d):
-            if solver.Value(x[i][day]) == 1:
-                assigned_day = day
-                break
-        if assigned_day is None:
-            raise HTTPException(status_code=503, detail="solver assignment is invalid")
-        pos = day_position_by_index.get(assigned_day)
-        if pos is None:
-            raise HTTPException(status_code=503, detail="solver used-day mapping is invalid")
-        day_indexes[pos].append(i)
-
-    arrival_anchor = None
-    if input_data.arrivalAirport is not None:
-        arrival_anchor = Anchor(
-            point_id=input_data.arrivalAirportId,
-            coord=Coord(
-                input_data.arrivalAirport.latitude,
-                input_data.arrivalAirport.longitude,
-            ),
-        )
-
-    # First pass order (for hotel selection).
-    day_orders: list[list[int]] = []
-    for pos in range(used_days):
-        start_for_day = arrival_anchor if pos == 0 else None
-        order = best_day_order(day_indexes[pos], input_data.points, start_for_day, transit_lookup)
-        day_orders.append(order)
-
-    hotel_by_id = {hotel.id: hotel for hotel in input_data.hotels}
-    day_hotels: list[str] = []
-    if input_data.hotelMode == "single":
-        hotel_id = choose_single_hotel(input_data.hotels, input_data.points, transit_lookup)
-        day_hotels = [hotel_id for _ in range(used_days)]
-    else:
-        for pos in range(used_days):
-            next_first_anchor = None
-            if pos + 1 < used_days and day_orders[pos + 1]:
-                next_point = input_data.points[day_orders[pos + 1][0]]
-                next_first_anchor = Anchor(
-                    point_id=next_point.id,
-                    coord=coord_from_point(next_point),
-                )
-
-            start_anchor = (
-                arrival_anchor
-                if pos == 0
-                else Anchor(
-                    point_id=day_hotels[pos - 1],
-                    coord=coord_from_hotel(hotel_by_id[day_hotels[pos - 1]]),
-                )
-            )
-
-            day_hotels.append(
-                choose_day_hotel(
-                    input_data.hotels,
-                    input_data.points,
-                    day_orders[pos],
-                    start_anchor,
-                    next_first_anchor,
-                    transit_lookup,
-                )
-            )
-
-    # Second pass order (day2+ starts from previous night hotel).
-    refined_orders: list[list[int]] = []
-    for pos in range(used_days):
-        if pos == 0:
-            start_anchor = arrival_anchor
-        else:
-            previous_hotel = hotel_by_id.get(day_hotels[pos - 1])
-            start_anchor = (
-                Anchor(day_hotels[pos - 1], coord_from_hotel(previous_hotel))
-                if previous_hotel
-                else None
-            )
-        refined_orders.append(
-            best_day_order(day_indexes[pos], input_data.points, start_anchor, transit_lookup)
-        )
-
-    start_date = input_data.arrivalDateTime.date()
-    plans: list[DayPlan] = []
-    for pos in range(used_days):
-        calendar_index = used_day_indexes[pos]
-        plans.append(
-            DayPlan(
-                dayNumber=pos + 1,
-                date=(start_date + timedelta(days=calendar_index)).isoformat(),
-                pointIds=[input_data.points[idx].id for idx in refined_orders[pos]],
-                hotelId=day_hotels[pos],
-            )
-        )
-
-    solver_status: Literal["OPTIMAL", "FEASIBLE"] = "OPTIMAL"
-    if status != cp_model.OPTIMAL:
-        solver_status = "FEASIBLE"
-    if (
-        input_data.objective == "min_days_then_transit"
-        and lexicographic_first_phase_status != cp_model.OPTIMAL
-    ):
-        solver_status = "FEASIBLE"
-
-    return SolveResponse(
-        tripDays=used_days,
-        solverStatus=solver_status,
-        objective=input_data.objective,
-        days=plans,
-    )
+    return assemble_response(req, p1, p3, precomputed)
