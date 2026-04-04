@@ -1,27 +1,12 @@
 {
   "city": "Beijing",
   "province": "Beijing",
-  "arrivalAirportCode": "PEK",
-  "departureAirportCode": "PEK",
-  "arrivalAirportId": "airport-pek-arrival",
-  "departureAirportId": "airport-pek-departure",
-  "arrivalAirport": {
-    "latitude": 40.0804,
-    "longitude": 116.6022
-  },
-  "departureAirport": {
-    "latitude": 40.0788,
-    "longitude": 116.6041
-  },
-  "arrivalAirportBufferMinutes": 45,
-  "departureAirportBufferMinutes": 150,
-  "arrivalDateTime": "2026-07-15T14:00:00+08:00",
-  "airportBufferMinutes": 90,
+  "startDate": "2026-07-15",
   "paceMode": "standard",
-  "hotelMode": "multi",
+  "hotelStrategy": "smart",
   "mealPolicy": "auto",
   "transportPreference": "mixed",
-  "maxDays": 5,
+  "maxDays": 8,
   "maxIntradayDrivingMinutes": 120,
   "points": [
     {
@@ -47,60 +32,6 @@
               "end": "17:00"
             }
           ]
-        },
-        {
-          "weekday": 1,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
-        },
-        {
-          "weekday": 2,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
-        },
-        {
-          "weekday": 3,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
-        },
-        {
-          "weekday": 4,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
-        },
-        {
-          "weekday": 5,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
-        },
-        {
-          "weekday": 6,
-          "periods": [
-            {
-              "start": "08:30",
-              "end": "17:00"
-            }
-          ]
         }
       ],
       "specialClosureDates": [],
@@ -114,7 +45,7 @@
     {
       "id": "wangfujing",
       "pointType": "shopping",
-      "suggestedDurationMinutes": 120,
+      "suggestedDurationMinutes": 150,
       "latitude": 39.9154,
       "longitude": 116.4103,
       "arrivalAnchor": {
@@ -134,99 +65,10 @@
               "end": "22:00"
             }
           ]
-        },
-        {
-          "weekday": 1,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:00"
-            }
-          ]
-        },
-        {
-          "weekday": 2,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:00"
-            }
-          ]
-        },
-        {
-          "weekday": 3,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:00"
-            }
-          ]
-        },
-        {
-          "weekday": 4,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:30"
-            }
-          ]
-        },
-        {
-          "weekday": 5,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:30"
-            }
-          ]
-        },
-        {
-          "weekday": 6,
-          "periods": [
-            {
-              "start": "10:00",
-              "end": "22:00"
-            }
-          ]
         }
       ],
       "specialClosureDates": [],
       "hasFoodCourt": true
-    },
-    {
-      "id": "quanjude",
-      "pointType": "restaurant",
-      "suggestedDurationMinutes": 90,
-      "latitude": 39.8954,
-      "longitude": 116.4049,
-      "arrivalAnchor": {
-        "latitude": 39.8956,
-        "longitude": 116.4043
-      },
-      "departureAnchor": {
-        "latitude": 39.8951,
-        "longitude": 116.4055
-      },
-      "mealSlots": [
-        "lunch",
-        "dinner"
-      ],
-      "mealTimeWindowsJson": [
-        {
-          "mealSlot": "lunch",
-          "start": "11:30",
-          "end": "14:30"
-        },
-        {
-          "mealSlot": "dinner",
-          "start": "17:30",
-          "end": "21:00"
-        }
-      ],
-      "queueProfileJson": {
-        "weekdayMinutes": 12,
-        "weekendMinutes": 25
-      }
     }
   ],
   "hotels": [
@@ -239,22 +81,26 @@
         "longitude": 116.4085
       },
       "departureAnchor": {
-        "latitude": 39.9339,
-        "longitude": 116.4078
+        "latitude": 39.9332,
+        "longitude": 116.4079
       },
-      "foreignerFriendly": true,
       "checkInTime": "15:00",
-      "checkOutTime": "12:00",
-      "bookingStatus": "available"
+      "checkOutTime": "12:00"
     },
     {
       "id": "hotel-chaoyang",
-      "latitude": 39.9143,
-      "longitude": 116.4816,
-      "foreignerFriendly": true,
+      "latitude": 39.9212,
+      "longitude": 116.4561,
+      "arrivalAnchor": {
+        "latitude": 39.9215,
+        "longitude": 116.4564
+      },
+      "departureAnchor": {
+        "latitude": 39.9209,
+        "longitude": 116.4558
+      },
       "checkInTime": "15:00",
-      "checkOutTime": "12:00",
-      "bookingStatus": "unknown"
+      "checkOutTime": "12:00"
     }
   ],
   "distanceMatrix": {
@@ -262,42 +108,32 @@
       {
         "fromPointId": "hotel-dongcheng",
         "toPointId": "forbidden-city",
-        "transitMinutes": 25,
+        "transitMinutes": 24,
         "drivingMinutes": 18,
-        "walkingMeters": 3400,
-        "walkingMinutes": 41,
-        "distanceKm": 3.4,
-        "transitSummary": "地铁 8 号线"
+        "walkingMeters": 3200,
+        "walkingMinutes": 38,
+        "distanceKm": 6.3,
+        "transitSummary": "metro"
       },
       {
         "fromPointId": "forbidden-city",
         "toPointId": "wangfujing",
-        "transitMinutes": 12,
-        "drivingMinutes": 10,
-        "walkingMeters": 1400,
-        "walkingMinutes": 17,
+        "transitMinutes": 14,
+        "drivingMinutes": 11,
+        "walkingMeters": 1200,
+        "walkingMinutes": 15,
         "distanceKm": 1.4,
-        "transitSummary": "步行+地铁"
+        "transitSummary": "walk"
       },
       {
         "fromPointId": "wangfujing",
-        "toPointId": "quanjude",
-        "transitMinutes": 16,
-        "drivingMinutes": 14,
-        "walkingMeters": 2300,
-        "walkingMinutes": 28,
-        "distanceKm": 2.3,
-        "transitSummary": "公交"
-      },
-      {
-        "fromPointId": "quanjude",
         "toPointId": "hotel-dongcheng",
-        "transitMinutes": 24,
-        "drivingMinutes": 17,
-        "walkingMeters": 3200,
-        "walkingMinutes": 39,
+        "transitMinutes": 18,
+        "drivingMinutes": 14,
+        "walkingMeters": 1800,
+        "walkingMinutes": 22,
         "distanceKm": 3.2,
-        "transitSummary": "地铁"
+        "transitSummary": "metro"
       }
     ]
   }

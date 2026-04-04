@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -21,17 +21,12 @@ PACE_MODE_WINDOWS: dict[str, tuple[str, str, int]] = {
 WALK_THRESHOLD_METERS = 1500
 WALK_SPEED_M_PER_MIN = 83
 MAX_EXACT_PERMUTATION_SIZE = 8
+MAX_POINTS_PER_DAY = 8
 TRAVEL_OVERHEAD_PER_POINT = 30
-MEAL_OVERHEAD_MINUTES = 45
-MEAL_MISS_PENALTY_MINUTES = 120
+LUNCH_OVERHEAD_MINUTES = 45
+LUNCH_INSERT_AFTER_MINUTES = 11 * 60 + 30
 PER_POINT_OVERHEAD_MINUTES = 12
-VIRTUAL_MEAL_MINUTES = 45
 GEO_ZIGZAG_PENALTY = 8.0
-
-MEAL_SLOT_WINDOWS: dict[str, tuple[int, int]] = {
-    "lunch": (11 * 60 + 30, 14 * 60 + 30),
-    "dinner": (17 * 60 + 30, 21 * 60),
-}
 
 
 class CoordinateIn(BaseModel):
@@ -55,15 +50,9 @@ class QueueProfileIn(BaseModel):
     holidayMinutes: int | None = PydField(default=None, ge=0, le=1440)
 
 
-class MealTimeWindowIn(BaseModel):
-    mealSlot: Literal["breakfast", "lunch", "dinner", "night_snack"]
-    start: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    end: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-
-
 class PointIn(BaseModel):
     id: str = PydField(min_length=1, max_length=64)
-    pointType: Literal["spot", "shopping", "restaurant"]
+    pointType: Literal["spot", "shopping"]
     suggestedDurationMinutes: int = PydField(ge=10, le=720)
     latitude: float | None = None
     longitude: float | None = None
@@ -73,10 +62,6 @@ class PointIn(BaseModel):
     specialClosureDates: list[date] = PydField(default_factory=list)
     lastEntryTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     hasFoodCourt: bool = False
-    mealSlots: list[Literal["breakfast", "lunch", "dinner", "night_snack"]] = PydField(
-        default_factory=list
-    )
-    mealTimeWindowsJson: list[MealTimeWindowIn] = PydField(default_factory=list)
     queueProfileJson: QueueProfileIn | None = None
 
 
@@ -86,10 +71,8 @@ class HotelIn(BaseModel):
     longitude: float | None = None
     arrivalAnchor: CoordinateIn | None = None
     departureAnchor: CoordinateIn | None = None
-    foreignerFriendly: bool = True
     checkInTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     checkOutTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    bookingStatus: Literal["available", "limited", "sold_out", "unknown"] | None = None
 
 
 class DistanceMatrixRowIn(BaseModel):
@@ -110,24 +93,14 @@ class DistanceMatrixIn(BaseModel):
 class SolveRequest(BaseModel):
     city: str | None = PydField(default=None, min_length=1, max_length=120)
     province: str | None = PydField(default=None, min_length=1, max_length=120)
-    arrivalAirport: CoordinateIn | None = None
-    departureAirport: CoordinateIn | None = None
-    arrivalAirportCode: str | None = PydField(default=None, pattern=r"^[A-Z]{3}$")
-    departureAirportCode: str | None = PydField(default=None, pattern=r"^[A-Z]{3}$")
-    arrivalAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
-    departureAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
-    arrivalAirportBufferMinutes: int | None = PydField(default=None, ge=0, le=480)
-    departureAirportBufferMinutes: int | None = PydField(default=None, ge=0, le=480)
-    arrivalDateTime: datetime
-    airportBufferMinutes: int = PydField(default=90, ge=60, le=120)
+    startDate: date
     points: list[PointIn] = PydField(min_length=1, max_length=200)
     hotels: list[HotelIn] = PydField(min_length=1, max_length=200)
     distanceMatrix: DistanceMatrixIn = PydField(default_factory=DistanceMatrixIn)
     paceMode: Literal["light", "standard", "compact"] = "standard"
-    hotelMode: Literal["single", "multi"] = "multi"
+    hotelStrategy: Literal["single", "smart"] = "smart"
     mealPolicy: Literal["auto", "off"] = "auto"
     transportPreference: Literal["transit_first", "driving_first", "mixed"] = "mixed"
-    maxDays: int = PydField(default=14, ge=1, le=14)
     maxIntradayDrivingMinutes: int = PydField(default=120, ge=30, le=480)
 
 
@@ -179,12 +152,11 @@ class DayWindow:
 class DayDiagnostics:
     travel_minutes: int
     queue_minutes: int
-    virtual_meal_minutes: int
-    meal_penalty_minutes: float
+    lunch_break_minutes: int
+    lunch_break_before_point_id: str | None
     hotel_switch: bool
     fallback_edges_used: int
     transport_modes: dict[str, int]
-    meal_status: dict[str, object]
     window_wait_minutes: int
     route_effective_cost: float
 
@@ -334,10 +306,6 @@ def queue_minutes_for_day(point: PointIn, day_value: date) -> int:
 def weekday_periods(point: PointIn, day_value: date) -> list[tuple[int, int]]:
     weekday = day_value.weekday()
     periods: list[tuple[int, int]] = []
-    if point.pointType == "restaurant" and point.mealTimeWindowsJson:
-        for item in point.mealTimeWindowsJson:
-            periods.append((parse_hhmm(item.start), parse_hhmm(item.end)))
-        return sorted(periods)
     for rule in point.openingHoursJson:
         if rule.weekday != weekday:
             continue
@@ -352,25 +320,10 @@ def day_is_closed(point: PointIn, day_value: date) -> bool:
     return len(weekday_periods(point, day_value)) == 0
 
 
-def restaurant_window_for_slot(point: PointIn, slot: str) -> tuple[int, int] | None:
-    for item in point.mealTimeWindowsJson:
-        if item.mealSlot == slot:
-            return parse_hhmm(item.start), parse_hhmm(item.end)
-    return MEAL_SLOT_WINDOWS.get(slot)
-
-
-def required_meal_slots(req: SolveRequest) -> list[str]:
-    if req.mealPolicy != "auto":
-        return []
-    if req.paceMode == "light":
-        return ["lunch"]
-    return ["lunch", "dinner"]
-
-
 def validate_request(req: SolveRequest) -> None:
     if req.transportPreference not in ("transit_first", "driving_first", "mixed"):
         raise HTTPException(status_code=400, detail="unsupported transportPreference")
-    if req.hotelMode == "single" and len(req.hotels) == 0:
+    if req.hotelStrategy == "single" and len(req.hotels) == 0:
         raise HTTPException(status_code=400, detail="single hotel mode requires hotels")
 
 
@@ -382,10 +335,9 @@ def filter_hotels(req: SolveRequest) -> list[HotelPrepared]:
             departure_coord=hotel_departure_coord(item),
         )
         for item in req.hotels
-        if item.foreignerFriendly and item.bookingStatus != "sold_out"
     ]
     if not prepared:
-        raise HTTPException(status_code=400, detail="no eligible hotels after foreigner/availability filtering")
+        raise HTTPException(status_code=400, detail="no eligible hotels provided")
     return prepared
 
 
@@ -404,21 +356,6 @@ def prepare_points(req: SolveRequest) -> list[PointPrepared]:
         if item.departure_coord.lat is None or item.departure_coord.lng is None:
             raise HTTPException(status_code=400, detail=f"point {item.point.id} missing departure coordinate")
     return prepared
-
-
-def arrival_anchor(req: SolveRequest) -> Anchor | None:
-    if req.arrivalAirport is None:
-        return None
-    coord = Coord(req.arrivalAirport.latitude, req.arrivalAirport.longitude)
-    return Anchor(req.arrivalAirportId or "__arrival_airport__", coord, coord)
-
-
-def departure_anchor(req: SolveRequest) -> Anchor | None:
-    if req.departureAirport is None:
-        return None
-    coord = Coord(req.departureAirport.latitude, req.departureAirport.longitude)
-    return Anchor(req.departureAirportId or "__departure_airport__", coord, coord)
-
 
 def build_lookup_maps(rows: list[DistanceMatrixRowIn]) -> LookupMaps:
     transit: dict[tuple[str, str], int] = {}
@@ -536,30 +473,14 @@ def directed_driving_minutes(
     return minutes
 
 
-def build_day_windows(req: SolveRequest) -> list[DayWindow]:
+def build_day_window(req: SolveRequest, calendar_index: int) -> DayWindow:
     pace_start, pace_end, _ = PACE_MODE_WINDOWS[req.paceMode]
-    start_minutes = parse_hhmm(pace_start)
-    end_minutes = parse_hhmm(pace_end)
-    arrival_buffer = req.arrivalAirportBufferMinutes or req.airportBufferMinutes
-
-    windows: list[DayWindow] = []
-    base_date = req.arrivalDateTime.date()
-    for calendar_index in range(req.maxDays):
-        day_value = base_date + timedelta(days=calendar_index)
-        day_start = start_minutes
-        day_end = end_minutes
-        if calendar_index == 0:
-            arrival_minutes = req.arrivalDateTime.hour * 60 + req.arrivalDateTime.minute
-            day_start = max(day_start, arrival_minutes + arrival_buffer)
-        windows.append(
-            DayWindow(
-                calendar_index=calendar_index,
-                date_value=day_value,
-                start_minutes=day_start,
-                end_minutes=day_end,
-            )
-        )
-    return windows
+    return DayWindow(
+        calendar_index=calendar_index,
+        date_value=req.startDate + timedelta(days=calendar_index),
+        start_minutes=parse_hhmm(pace_start),
+        end_minutes=parse_hhmm(pace_end),
+    )
 
 
 def point_day_load(point: PointIn, day_value: date) -> int:
@@ -570,8 +491,6 @@ def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
     if window.end_minutes <= window.start_minutes:
         return False
     if day_is_closed(point, window.date_value):
-        return False
-    if point.pointType == "restaurant" and (not point.mealSlots or not point.mealTimeWindowsJson):
         return False
     if point.pointType == "spot" and not point.lastEntryTime:
         return False
@@ -598,19 +517,43 @@ def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
 def effective_day_capacity(req: SolveRequest, n_points: int, has_food: bool) -> int:
     base = PACE_MODE_WINDOWS[req.paceMode][2]
     if req.mealPolicy == "auto" and not has_food:
-        base -= len(required_meal_slots(req)) * MEAL_OVERHEAD_MINUTES
+        base -= LUNCH_OVERHEAD_MINUTES
     base -= (n_points + 1) * TRAVEL_OVERHEAD_PER_POINT
     return max(120, base)
 
 
 def cluster_has_food(cluster: list[int], points: list[PointPrepared]) -> bool:
-    for index in cluster:
-        point = points[index].point
-        if point.hasFoodCourt:
-            return True
-        if point.pointType == "restaurant" and any(slot in ("lunch", "dinner") for slot in point.mealSlots):
-            return True
-    return False
+    if any(points[index].point.hasFoodCourt for index in cluster):
+        return True
+    return all(points[index].point.suggestedDurationMinutes >= 240 for index in cluster)
+
+
+def cluster_weight(
+    from_index: int,
+    to_index: int,
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+) -> float:
+    from_point = points[from_index]
+    to_point = points[to_index]
+    walking_distance = lookup_walking_distance(
+        from_point.point.id,
+        from_point.departure_coord,
+        to_point.point.id,
+        to_point.arrival_coord,
+        lookups,
+    )
+    if 0 < walking_distance <= WALK_THRESHOLD_METERS:
+        return float(walking_distance)
+    return float(
+        directed_driving_minutes(
+            from_point.point.id,
+            from_point.departure_coord,
+            to_point.point.id,
+            to_point.arrival_coord,
+            lookups,
+        )
+    )
 
 
 def pick_seed(candidates: list[int], points: list[PointPrepared], lookups: LookupMaps) -> int:
@@ -621,13 +564,7 @@ def pick_seed(candidates: list[int], points: list[PointPrepared], lookups: Looku
         for other in candidates:
             if other == index:
                 continue
-            total += directed_driving_minutes(
-                points[index].point.id,
-                points[index].departure_coord,
-                points[other].point.id,
-                points[other].arrival_coord,
-                lookups,
-            )
+            total += cluster_weight(index, other, points, lookups)
         if total < best_cost:
             best_cost = total
             best_index = index
@@ -645,13 +582,7 @@ def pick_nearest_to_cluster(
     for index in candidates:
         total = 0.0
         for cluster_index in cluster:
-            total += directed_driving_minutes(
-                points[cluster_index].point.id,
-                points[cluster_index].departure_coord,
-                points[index].point.id,
-                points[index].arrival_coord,
-                lookups,
-            )
+            total += cluster_weight(cluster_index, index, points, lookups)
         avg = total / max(1, len(cluster))
         if avg < best_cost:
             best_cost = avg
@@ -663,19 +594,27 @@ def cluster_points_to_days(
     req: SolveRequest,
     points: list[PointPrepared],
     lookups: LookupMaps,
-    windows: list[DayWindow],
 ) -> list[tuple[DayWindow, list[int]]]:
-    """Returns list of (window, point_indexes) pairs.
-    Skipped windows (no available points) are excluded, so the returned list
-    may be shorter than windows and may start from a later calendar day."""
     unassigned = list(range(len(points)))
     day_clusters: list[tuple[DayWindow, list[int]]] = []
+    calendar_index = 0
+    max_calendar_span = max(366, len(points) * 30)
 
-    for window in windows:
-        if not unassigned:
-            break
+    while unassigned:
+        if calendar_index >= max_calendar_span:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "POINTS_CANNOT_BE_SCHEDULED",
+                    "message": "remaining points cannot be scheduled within a reasonable calendar span",
+                    "remainingPointIds": [points[index].point.id for index in unassigned],
+                },
+            )
+
+        window = build_day_window(req, calendar_index)
         available_today = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
         if not available_today:
+            calendar_index += 1
             continue
 
         seed = pick_seed(available_today, points, lookups)
@@ -686,6 +625,8 @@ def cluster_points_to_days(
         while True:
             candidates = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
             if not candidates:
+                break
+            if len(cluster) >= MAX_POINTS_PER_DAY:
                 break
             next_index = pick_nearest_to_cluster(candidates, cluster, points, lookups)
             has_food = cluster_has_food(cluster + [next_index], points)
@@ -699,16 +640,8 @@ def cluster_points_to_days(
 
         if cluster:
             day_clusters.append((window, cluster))
+        calendar_index += 1
 
-    if unassigned:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "POINTS_EXCEED_MAX_DAYS",
-                "message": f"{len(unassigned)} point(s) cannot fit within {req.maxDays} days",
-                "remainingPointIds": [points[index].point.id for index in unassigned],
-            },
-        )
     return day_clusters
 
 
@@ -745,6 +678,26 @@ def find_nearest_hotel(
     return best_hotel
 
 
+def average_one_way_driving_minutes(
+    hotel_index: int,
+    point_indexes: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    lookups: LookupMaps,
+) -> float:
+    hotel = hotels[hotel_index]
+    total = 0.0
+    for point_index in point_indexes:
+        total += directed_driving_minutes(
+            hotel.hotel.id,
+            hotel.departure_coord,
+            points[point_index].point.id,
+            points[point_index].arrival_coord,
+            lookups,
+        )
+    return total / max(1, len(point_indexes))
+
+
 def assign_hotel_per_day(
     day_clusters: list[tuple[DayWindow, list[int]]],
     points: list[PointPrepared],
@@ -753,11 +706,27 @@ def assign_hotel_per_day(
     req: SolveRequest,
 ) -> list[int]:
     clusters_only = [cluster for _, cluster in day_clusters]
-    if req.hotelMode == "single":
+    if req.hotelStrategy == "single":
         all_point_indexes = [index for cluster in clusters_only for index in cluster]
         best = find_nearest_hotel(all_point_indexes, points, hotels, lookups)
         return [best] * len(clusters_only)
-    return [find_nearest_hotel(cluster, points, hotels, lookups) for cluster in clusters_only]
+
+    if not clusters_only:
+        return []
+
+    all_point_indexes = [index for cluster in clusters_only for index in cluster]
+    current_hotel = find_nearest_hotel(all_point_indexes, points, hotels, lookups)
+    assignments: list[int] = []
+
+    for cluster in clusters_only:
+        best_for_day = find_nearest_hotel(cluster, points, hotels, lookups)
+        current_avg = average_one_way_driving_minutes(current_hotel, cluster, points, hotels, lookups)
+        best_avg = average_one_way_driving_minutes(best_for_day, cluster, points, hotels, lookups)
+        if current_avg > 40.0 and best_avg + 20.0 < current_avg:
+            current_hotel = best_for_day
+        assignments.append(current_hotel)
+
+    return assignments
 
 
 def opening_period_for_arrival(point: PointIn, day_value: date, arrival_minutes: int) -> tuple[int, int] | None:
@@ -769,23 +738,6 @@ def opening_period_for_arrival(point: PointIn, day_value: date, arrival_minutes:
             continue
         return start_candidate, period_end
     return None
-
-
-def maybe_insert_virtual_meal_soft(
-    current_minutes: int,
-    slot: str,
-    satisfied: set[str],
-    day_end_minutes: int,
-) -> tuple[int, bool, float]:
-    if slot in satisfied:
-        return current_minutes, False, 0.0
-    slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
-    meal_start = max(current_minutes, slot_start)
-    meal_end = meal_start + VIRTUAL_MEAL_MINUTES
-    if meal_end > min(slot_end, day_end_minutes):
-        return current_minutes, False, float(MEAL_MISS_PENALTY_MINUTES)
-    satisfied.add(slot)
-    return meal_end, True, 0.0
 
 
 def extract_http_detail_message(detail: object) -> str:
@@ -831,54 +783,44 @@ def evaluate_order(
     hotel = hotels[hotel_index]
     route_points = [points[day_point_indexes[index]] for index in ordering]
     day_end_limit = day_window.end_minutes
-    if is_last_day and req.departureAirportBufferMinutes:
-        day_end_limit = max(day_window.start_minutes, day_end_limit - req.departureAirportBufferMinutes)
 
     current_time = day_window.start_minutes
     current_id = start_anchor.node_id
     current_coord = start_anchor.departure
-    satisfied_meals: set[str] = set()
-    required_meals = required_meal_slots(req)
     transport_modes = {"walking": 0, "transit": 0, "driving": 0}
     queue_total = 0
     travel_total = 0
     wait_total = 0
     fallback_edges = 0
-    virtual_meal_total = 0
-    meal_penalty = 0.0
+    lunch_inserted = False
+    lunch_break_minutes = 0
+    lunch_break_before_point_id: str | None = None
+    day_has_food = any(route_point.point.hasFoodCourt for route_point in route_points) or all(
+        route_point.point.suggestedDurationMinutes >= 240 for route_point in route_points
+    )
 
     for route_point in route_points:
         point = route_point.point
         choice = lookup_travel_choice(current_id, current_coord, point.id, route_point.arrival_coord, req, lookups)
-        tentative_time = current_time + choice.minutes
-
-        for slot in required_meals:
-            if slot in satisfied_meals:
-                continue
-            slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
-            point_can_cover_slot = (
-                (point.pointType == "restaurant" and slot in (point.mealSlots or []))
-                or (point.hasFoodCourt and slot in ("lunch", "dinner"))
-            )
-            if not point_can_cover_slot and tentative_time > slot_end:
-                current_time, inserted, penalty = maybe_insert_virtual_meal_soft(
-                    current_time,
-                    slot,
-                    satisfied_meals,
-                    day_end_limit,
-                )
-                if inserted:
-                    virtual_meal_total += VIRTUAL_MEAL_MINUTES
-                meal_penalty += penalty
-                choice = lookup_travel_choice(current_id, current_coord, point.id, route_point.arrival_coord, req, lookups)
-                tentative_time = current_time + choice.minutes
-            elif point_can_cover_slot and tentative_time < slot_start:
-                tentative_time = slot_start
 
         transport_modes[choice.mode] += 1
         travel_total += choice.minutes
         fallback_edges += int(choice.used_fallback)
         current_time += choice.minutes
+
+        if (
+            not lunch_inserted
+            and req.mealPolicy == "auto"
+            and not day_has_food
+            and current_time >= LUNCH_INSERT_AFTER_MINUTES
+        ):
+            lunch_end = current_time + LUNCH_OVERHEAD_MINUTES
+            if lunch_end > day_end_limit:
+                raise HTTPException(status_code=400, detail="lunch break exceeds day window")
+            current_time = lunch_end
+            lunch_inserted = True
+            lunch_break_minutes = LUNCH_OVERHEAD_MINUTES
+            lunch_break_before_point_id = point.id
 
         if day_is_closed(point, day_window.date_value):
             raise HTTPException(status_code=400, detail=f"point {point.id} closed on scheduled day")
@@ -897,37 +839,9 @@ def evaluate_order(
         if service_end > service_window_end or service_end > day_end_limit:
             raise HTTPException(status_code=400, detail=f"point {point.id} exceeds open window")
 
-        for slot in required_meals:
-            if point.hasFoodCourt and slot in ("lunch", "dinner"):
-                slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
-                if current_time < slot_end and service_end > slot_start:
-                    satisfied_meals.add(slot)
-                continue
-            if point.pointType != "restaurant" or slot not in point.mealSlots:
-                continue
-            meal_window = restaurant_window_for_slot(point, slot)
-            if meal_window is None:
-                continue
-            slot_start, slot_end = meal_window
-            if current_time < slot_end and service_end > slot_start:
-                satisfied_meals.add(slot)
-
         current_time = service_end
         current_id = point.id
         current_coord = route_point.departure_coord
-
-    for slot in required_meals:
-        if slot in satisfied_meals:
-            continue
-        current_time, inserted, penalty = maybe_insert_virtual_meal_soft(
-            current_time,
-            slot,
-            satisfied_meals,
-            day_end_limit,
-        )
-        if inserted:
-            virtual_meal_total += VIRTUAL_MEAL_MINUTES
-        meal_penalty += penalty
 
     hotel_choice = lookup_travel_choice(current_id, current_coord, hotel.hotel.id, hotel.arrival_coord, req, lookups)
     transport_modes[hotel_choice.mode] += 1
@@ -945,7 +859,7 @@ def evaluate_order(
         raise HTTPException(status_code=400, detail="day route exceeds day window")
 
     route_coords = [start_anchor.departure] + [item.arrival_coord for item in route_points] + [hotel.arrival_coord]
-    effective_cost = float(travel_total) + geo_route_penalty(route_coords) + meal_penalty + float(wait_total) * 0.2
+    effective_cost = float(travel_total) + geo_route_penalty(route_coords) + float(wait_total) * 0.2
 
     return EvaluatedRoute(
         ordering=ordering,
@@ -955,54 +869,16 @@ def evaluate_order(
         diagnostics=DayDiagnostics(
             travel_minutes=travel_total,
             queue_minutes=queue_total,
-            virtual_meal_minutes=virtual_meal_total,
-            meal_penalty_minutes=meal_penalty,
+            lunch_break_minutes=lunch_break_minutes,
+            lunch_break_before_point_id=lunch_break_before_point_id,
             hotel_switch=previous_hotel_index is not None and previous_hotel_index != hotel_index,
             fallback_edges_used=fallback_edges,
             transport_modes=transport_modes,
-            meal_status={
-                "required": required_meals,
-                "satisfied": sorted(satisfied_meals),
-                "virtualMealInserted": virtual_meal_total > 0,
-                "penaltyApplied": meal_penalty > 0,
-            },
             window_wait_minutes=wait_total,
             route_effective_cost=effective_cost,
         ),
         end_time_minutes=current_time,
     )
-
-
-def nearest_neighbor_order(
-    req: SolveRequest,
-    points: list[PointPrepared],
-    day_point_indexes: list[int],
-    start_anchor: Anchor,
-    lookups: LookupMaps,
-) -> list[int]:
-    if not day_point_indexes:
-        return []
-    remaining = list(day_point_indexes)
-    ordering: list[int] = []
-    current_id = start_anchor.node_id
-    current_coord = start_anchor.departure
-    while remaining:
-        next_point = min(
-            remaining,
-            key=lambda index: lookup_travel_choice(
-                current_id,
-                current_coord,
-                points[index].point.id,
-                points[index].arrival_coord,
-                req,
-                lookups,
-            ).minutes,
-        )
-        ordering.append(day_point_indexes.index(next_point))
-        current_id = points[next_point].point.id
-        current_coord = points[next_point].departure_coord
-        remaining.remove(next_point)
-    return ordering
 
 
 def solve_day_route(
@@ -1032,64 +908,39 @@ def solve_day_route(
             is_last_day,
         )
 
-    if len(day_point_indexes) <= MAX_EXACT_PERMUTATION_SIZE:
-        best: EvaluatedRoute | None = None
-        failures: list[str] = []
-        route_points = [points[day_point_indexes[idx]] for idx in range(len(day_point_indexes))]
-        for ordering in itertools.permutations(range(len(day_point_indexes))):
-            try:
-                candidate = evaluate_order(
-                    req,
-                    points,
-                    hotels,
-                    day_window,
-                    hotel_index,
-                    day_point_indexes,
-                    list(ordering),
-                    lookups,
-                    start_anchor,
-                    previous_hotel_index,
-                    is_last_day,
-                )
-            except HTTPException as exc:
-                failures.append(extract_http_detail_message(exc.detail))
-                continue
-            if best is None or candidate.effective_cost < best.effective_cost:
-                best = candidate
-        if best is None:
-            raise HTTPException(status_code=400, detail=build_no_feasible_ordering_detail(route_points, failures))
-        return best
-
-    base_order = nearest_neighbor_order(req, points, day_point_indexes, start_anchor, lookups)
-    return evaluate_order(
-        req,
-        points,
-        hotels,
-        day_window,
-        hotel_index,
-        day_point_indexes,
-        base_order,
-        lookups,
-        start_anchor,
-        previous_hotel_index,
-        is_last_day,
-    )
+    best: EvaluatedRoute | None = None
+    failures: list[str] = []
+    route_points = [points[day_point_indexes[idx]] for idx in range(len(day_point_indexes))]
+    for ordering in itertools.permutations(range(len(day_point_indexes))):
+        try:
+            candidate = evaluate_order(
+                req,
+                points,
+                hotels,
+                day_window,
+                hotel_index,
+                day_point_indexes,
+                list(ordering),
+                lookups,
+                start_anchor,
+                previous_hotel_index,
+                is_last_day,
+            )
+        except HTTPException as exc:
+            failures.append(extract_http_detail_message(exc.detail))
+            continue
+        if best is None or candidate.effective_cost < best.effective_cost:
+            best = candidate
+    if best is None:
+        raise HTTPException(status_code=400, detail=build_no_feasible_ordering_detail(route_points, failures))
+    return best
 
 
 def build_start_anchor(
-    req: SolveRequest,
     hotels: list[HotelPrepared],
-    day_position: int,
-    day_calendar_index: int,
     hotel_index: int,
     previous_hotel_index: int | None,
 ) -> Anchor:
-    if day_position == 0:
-        arrival = arrival_anchor(req)
-        if day_calendar_index == 0 and arrival is not None:
-            return arrival
-        hotel = hotels[hotel_index]
-        return Anchor(hotel.hotel.id, hotel.departure_coord, hotel.departure_coord)
     if previous_hotel_index is None:
         hotel = hotels[hotel_index]
         return Anchor(hotel.hotel.id, hotel.departure_coord, hotel.departure_coord)
@@ -1107,8 +958,7 @@ def build_solver_diagnostics(
 ) -> dict[str, object]:
     total_queue = sum(route.diagnostics.queue_minutes for route in day_routes)
     total_travel = sum(route.diagnostics.travel_minutes for route in day_routes)
-    total_virtual_meal = sum(route.diagnostics.virtual_meal_minutes for route in day_routes)
-    total_meal_penalty = sum(route.diagnostics.meal_penalty_minutes for route in day_routes)
+    total_lunch_break = sum(route.diagnostics.lunch_break_minutes for route in day_routes)
     total_fallback = sum(route.diagnostics.fallback_edges_used for route in day_routes)
     hotel_switches = sum(1 for route in day_routes if route.diagnostics.hotel_switch)
 
@@ -1118,8 +968,7 @@ def build_solver_diagnostics(
         "hotelSwitches": hotel_switches,
         "totalTravelMinutes": total_travel,
         "totalQueueMinutes": total_queue,
-        "totalVirtualMealMinutes": total_virtual_meal,
-        "totalMealPenaltyMinutes": total_meal_penalty,
+        "totalLunchBreakMinutes": total_lunch_break,
         "fallbackEdgesUsed": total_fallback,
         "days": [
             {
@@ -1129,12 +978,11 @@ def build_solver_diagnostics(
                 "hotelId": hotels[hotel_indexes[index]].hotel.id,
                 "travelMinutes": route.diagnostics.travel_minutes,
                 "queueMinutes": route.diagnostics.queue_minutes,
-                "virtualMealMinutes": route.diagnostics.virtual_meal_minutes,
-                "mealPenaltyMinutes": route.diagnostics.meal_penalty_minutes,
+                "lunchBreakMinutes": route.diagnostics.lunch_break_minutes,
+                "lunchBreakBeforePointId": route.diagnostics.lunch_break_before_point_id,
                 "hotelSwitch": route.diagnostics.hotel_switch,
                 "fallbackEdgesUsed": route.diagnostics.fallback_edges_used,
                 "transportModes": route.diagnostics.transport_modes,
-                "mealStatus": route.diagnostics.meal_status,
                 "windowWaitMinutes": route.diagnostics.window_wait_minutes,
             }
             for index, ((window, cluster), route) in enumerate(zip(day_clusters, day_routes))
@@ -1147,9 +995,7 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
     points = prepare_points(req)
     hotels = filter_hotels(req)
     lookups = build_lookup_maps(req.distanceMatrix.rows)
-    windows = build_day_windows(req)
-
-    day_clusters = cluster_points_to_days(req, points, lookups, windows)
+    day_clusters = cluster_points_to_days(req, points, lookups)
     hotel_per_day = assign_hotel_per_day(day_clusters, points, hotels, lookups, req)
 
     days: list[DayPlan] = []
@@ -1158,7 +1004,7 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
     for day_position, (window, cluster) in enumerate(day_clusters):
         hotel_index = hotel_per_day[day_position]
         previous_hotel_index = hotel_per_day[day_position - 1] if day_position > 0 else None
-        start = build_start_anchor(req, hotels, day_position, window.calendar_index, hotel_index, previous_hotel_index)
+        start = build_start_anchor(hotels, hotel_index, previous_hotel_index)
         is_last = day_position == len(day_clusters) - 1
 
         try:
