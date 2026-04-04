@@ -3,14 +3,14 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
-from ortools.sat.python import cp_model
 from pydantic import BaseModel, Field as PydField
 
-app = FastAPI(title="Optivoy Optimizer", version="0.3.0")
+app = FastAPI(title="Optivoy Optimizer", version="0.8.0")
+
 
 PACE_MODE_WINDOWS: dict[str, tuple[str, str, int]] = {
     "light": ("10:00", "18:00", 480),
@@ -18,23 +18,47 @@ PACE_MODE_WINDOWS: dict[str, tuple[str, str, int]] = {
     "compact": ("08:00", "21:00", 780),
 }
 
-PER_POINT_OVERHEAD_MINUTES = 12
+WALK_THRESHOLD_METERS = 1500
+WALK_SPEED_M_PER_MIN = 83
 MAX_EXACT_PERMUTATION_SIZE = 8
-GEO_ZIGZAG_PENALTY = 0.01
+TRAVEL_OVERHEAD_PER_POINT = 30
+MEAL_OVERHEAD_MINUTES = 45
+MEAL_MISS_PENALTY_MINUTES = 120
+PER_POINT_OVERHEAD_MINUTES = 12
+VIRTUAL_MEAL_MINUTES = 45
+GEO_ZIGZAG_PENALTY = 8.0
 
-# ── 酒店切换阈值（公里）─────────────────────────────────────
-# 两天点位质心距离超过此值，鼓励换酒店；低于此值偏向留同一家
-HOTEL_SWITCH_DISTANCE_KM = 15.0
-HOTEL_SWITCH_PENALTY_MINUTES = 45
+MEAL_SLOT_WINDOWS: dict[str, tuple[int, int]] = {
+    "lunch": (11 * 60 + 30, 14 * 60 + 30),
+    "dinner": (17 * 60 + 30, 21 * 60),
+}
 
-
-# ═══════════════════════════════════════════════════════════
-# Pydantic 模型（与 v0.2.3 保持一致）
-# ═══════════════════════════════════════════════════════════
 
 class CoordinateIn(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
+
+
+class PlanningTimeRangeIn(BaseModel):
+    start: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class OpeningHoursRuleIn(BaseModel):
+    weekday: int = PydField(ge=0, le=6)
+    periods: list[PlanningTimeRangeIn] = PydField(min_length=1, max_length=8)
+
+
+class QueueProfileIn(BaseModel):
+    weekdayMinutes: int | None = PydField(default=None, ge=0, le=1440)
+    weekendMinutes: int | None = PydField(default=None, ge=0, le=1440)
+    holidayMinutes: int | None = PydField(default=None, ge=0, le=1440)
+
+
+class MealTimeWindowIn(BaseModel):
+    mealSlot: Literal["breakfast", "lunch", "dinner", "night_snack"]
+    start: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end: str = PydField(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
 class PointIn(BaseModel):
@@ -43,12 +67,29 @@ class PointIn(BaseModel):
     suggestedDurationMinutes: int = PydField(ge=10, le=720)
     latitude: float | None = None
     longitude: float | None = None
+    arrivalAnchor: CoordinateIn | None = None
+    departureAnchor: CoordinateIn | None = None
+    openingHoursJson: list[OpeningHoursRuleIn] = PydField(default_factory=list)
+    specialClosureDates: list[date] = PydField(default_factory=list)
+    lastEntryTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    hasFoodCourt: bool = False
+    mealSlots: list[Literal["breakfast", "lunch", "dinner", "night_snack"]] = PydField(
+        default_factory=list
+    )
+    mealTimeWindowsJson: list[MealTimeWindowIn] = PydField(default_factory=list)
+    queueProfileJson: QueueProfileIn | None = None
 
 
 class HotelIn(BaseModel):
     id: str = PydField(min_length=1, max_length=64)
     latitude: float | None = None
     longitude: float | None = None
+    arrivalAnchor: CoordinateIn | None = None
+    departureAnchor: CoordinateIn | None = None
+    foreignerFriendly: bool = True
+    checkInTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    checkOutTime: str | None = PydField(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    bookingStatus: Literal["available", "limited", "sold_out", "unknown"] | None = None
 
 
 class DistanceMatrixRowIn(BaseModel):
@@ -57,6 +98,7 @@ class DistanceMatrixRowIn(BaseModel):
     transitMinutes: int = PydField(ge=1, le=1440)
     drivingMinutes: int = PydField(ge=1, le=1440)
     walkingMeters: int = PydField(ge=0, le=200000)
+    walkingMinutes: int | None = PydField(default=None, ge=0, le=2880)
     distanceKm: float = PydField(ge=0, le=2000)
     transitSummary: str | None = None
 
@@ -74,6 +116,8 @@ class SolveRequest(BaseModel):
     departureAirportCode: str | None = PydField(default=None, pattern=r"^[A-Z]{3}$")
     arrivalAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
     departureAirportId: str | None = PydField(default=None, min_length=1, max_length=64)
+    arrivalAirportBufferMinutes: int | None = PydField(default=None, ge=0, le=480)
+    departureAirportBufferMinutes: int | None = PydField(default=None, ge=0, le=480)
     arrivalDateTime: datetime
     airportBufferMinutes: int = PydField(default=90, ge=60, le=120)
     points: list[PointIn] = PydField(min_length=1, max_length=200)
@@ -82,16 +126,9 @@ class SolveRequest(BaseModel):
     paceMode: Literal["light", "standard", "compact"] = "standard"
     hotelMode: Literal["single", "multi"] = "multi"
     mealPolicy: Literal["auto", "off"] = "auto"
-    objective: Literal["min_days", "min_transit", "min_days_then_transit"] = (
-        "min_days_then_transit"
-    )
+    transportPreference: Literal["transit_first", "driving_first", "mixed"] = "mixed"
     maxDays: int = PydField(default=14, ge=1, le=14)
-    timeLimitSeconds: float = PydField(default=2.5, ge=0.2, le=30.0)
-    switchPenaltyMinutes: int = PydField(default=45, ge=0, le=600)
-    newHotelPenaltyMinutes: int = PydField(default=30, ge=0, le=600)
-    maxIterations: int = PydField(default=3, ge=1, le=8)
-    badDayTransitMinutesThreshold: int = PydField(default=0, ge=0, le=5000)
-    badDayPenaltyMinutes: int = PydField(default=120, ge=0, le=5000)
+    maxIntradayDrivingMinutes: int = PydField(default=120, ge=30, le=480)
 
 
 class DayPlan(BaseModel):
@@ -109,10 +146,6 @@ class SolveResponse(BaseModel):
     diagnostics: dict[str, object] | None = None
 
 
-# ═══════════════════════════════════════════════════════════
-# 几何工具
-# ═══════════════════════════════════════════════════════════
-
 @dataclass(frozen=True)
 class Coord:
     lat: float | None
@@ -122,79 +155,152 @@ class Coord:
 @dataclass(frozen=True)
 class Anchor:
     node_id: str | None
-    coord: Coord
+    arrival: Coord
+    departure: Coord
+
+
+@dataclass(frozen=True)
+class EdgeChoice:
+    minutes: int
+    mode: Literal["walking", "transit", "driving"]
+    used_fallback: bool
+    summary: str | None = None
+
+
+@dataclass(frozen=True)
+class DayWindow:
+    calendar_index: int
+    date_value: date
+    start_minutes: int
+    end_minutes: int
+
+
+@dataclass
+class DayDiagnostics:
+    travel_minutes: int
+    queue_minutes: int
+    virtual_meal_minutes: int
+    meal_penalty_minutes: float
+    hotel_switch: bool
+    fallback_edges_used: int
+    transport_modes: dict[str, int]
+    meal_status: dict[str, object]
+    window_wait_minutes: int
+    route_effective_cost: float
+
+
+@dataclass
+class EvaluatedRoute:
+    ordering: list[int]
+    point_ids: list[str]
+    travel_minutes: int
+    effective_cost: float
+    diagnostics: DayDiagnostics
+    end_time_minutes: int
+
+
+@dataclass
+class PointPrepared:
+    point: PointIn
+    arrival_coord: Coord
+    departure_coord: Coord
+
+
+@dataclass
+class HotelPrepared:
+    hotel: HotelIn
+    arrival_coord: Coord
+    departure_coord: Coord
+
+
+@dataclass
+class LookupMaps:
+    transit: dict[tuple[str, str], int]
+    driving: dict[tuple[str, str], int]
+    walking_meters: dict[tuple[str, str], int]
+    walking_minutes: dict[tuple[str, str], int]
+    distance_km: dict[tuple[str, str], float]
+    transit_summary: dict[tuple[str, str], str]
+
+
+def parse_hhmm(value: str) -> int:
+    hour, minute = value.split(":", 1)
+    return int(hour) * 60 + int(minute)
 
 
 def haversine_km(a: Coord, b: Coord) -> float:
-    if a.lat is None or a.lng is None or b.lat is None or b.lng is None:
+    if None in (a.lat, a.lng, b.lat, b.lng):
         return 8.0
     r = math.pi / 180.0
-    dlat = (b.lat - a.lat) * r
-    dlng = (b.lng - a.lng) * r
+    dlat = (b.lat - a.lat) * r  # type: ignore[operator]
+    dlng = (b.lng - a.lng) * r  # type: ignore[operator]
     h = (
         math.sin(dlat / 2.0) ** 2
-        + math.cos(a.lat * r) * math.cos(b.lat * r) * math.sin(dlng / 2.0) ** 2
+        + math.cos(a.lat * r) * math.cos(b.lat * r) * math.sin(dlng / 2.0) ** 2  # type: ignore[operator]
     )
-    return 6371.0 * 2.0 * math.atan2(math.sqrt(h), math.sqrt(1.0 - h))
+    return 6371.0 * 2.0 * math.atan2(math.sqrt(h), math.sqrt(max(1e-9, 1.0 - h)))
 
 
-def _fallback_minutes(a: Coord, b: Coord) -> int:
-    km = haversine_km(a, b)
-    return max(8, int(round(km / 25.0 * 60.0 + 8)))
+def fallback_distance_km(a: Coord, b: Coord) -> float:
+    return max(0.1, haversine_km(a, b))
 
 
-def coord_of(p: PointIn | HotelIn) -> Coord:
-    return Coord(p.latitude, p.longitude)
+def fallback_driving_minutes(a: Coord, b: Coord) -> int:
+    return max(8, int(round(fallback_distance_km(a, b) / 25.0 * 60.0 + 8)))
 
 
-def _parse_hhmm(value: str) -> tuple[int, int]:
-    h, m = value.split(":", 1)
-    return int(h), int(m)
+def fallback_transit_minutes(a: Coord, b: Coord) -> int:
+    return max(10, int(round(fallback_distance_km(a, b) / 18.0 * 60.0 + 12)))
 
 
-def build_lookup(rows: list[DistanceMatrixRowIn]) -> dict[tuple[str, str], int]:
-    lookup: dict[tuple[str, str], int] = {}
-    for row in rows:
-        key = (row.fromPointId, row.toPointId)
-        current = lookup.get(key)
-        if current is None or row.transitMinutes < current:
-            lookup[key] = row.transitMinutes
-    return lookup
+def fallback_walking_minutes(a: Coord, b: Coord) -> int:
+    return max(3, int(round(fallback_distance_km(a, b) / 4.5 * 60.0)))
 
 
-def directed(
-    from_id: str | None,
-    from_coord: Coord,
-    to_id: str | None,
-    to_coord: Coord,
-    lookup: dict[tuple[str, str], int],
-) -> int:
-    if from_id and to_id:
-        direct = lookup.get((from_id, to_id))
-        if direct is not None and direct > 0:
-            return direct
-        reverse = lookup.get((to_id, from_id))
-        if reverse is not None and reverse > 0:
-            return reverse
-    return _fallback_minutes(from_coord, to_coord)
+def fallback_walking_meters(a: Coord, b: Coord) -> int:
+    return max(100, int(round(fallback_distance_km(a, b) * 1000)))
 
 
-def symmetric(
-    from_id: str | None,
-    from_coord: Coord,
-    to_id: str | None,
-    to_coord: Coord,
-    lookup: dict[tuple[str, str], int],
-) -> int:
-    return directed(from_id, from_coord, to_id, to_coord, lookup)
+def point_arrival_coord(point: PointIn) -> Coord:
+    if point.arrivalAnchor and point.arrivalAnchor.latitude is not None and point.arrivalAnchor.longitude is not None:
+        return Coord(point.arrivalAnchor.latitude, point.arrivalAnchor.longitude)
+    return Coord(point.latitude, point.longitude)
 
 
-def _geo_zigzag_penalty(coords: list[Coord]) -> float:
+def point_departure_coord(point: PointIn) -> Coord:
+    if point.departureAnchor and point.departureAnchor.latitude is not None and point.departureAnchor.longitude is not None:
+        return Coord(point.departureAnchor.latitude, point.departureAnchor.longitude)
+    return Coord(point.latitude, point.longitude)
+
+
+def hotel_arrival_coord(hotel: HotelIn) -> Coord:
+    if hotel.arrivalAnchor and hotel.arrivalAnchor.latitude is not None and hotel.arrivalAnchor.longitude is not None:
+        return Coord(hotel.arrivalAnchor.latitude, hotel.arrivalAnchor.longitude)
+    return Coord(hotel.latitude, hotel.longitude)
+
+
+def hotel_departure_coord(hotel: HotelIn) -> Coord:
+    if hotel.departureAnchor and hotel.departureAnchor.latitude is not None and hotel.departureAnchor.longitude is not None:
+        return Coord(hotel.departureAnchor.latitude, hotel.departureAnchor.longitude)
+    return Coord(hotel.latitude, hotel.longitude)
+
+
+def centroid(coords: list[Coord]) -> Coord:
+    valid = [(c.lat, c.lng) for c in coords if c.lat is not None and c.lng is not None]
+    if not valid:
+        return Coord(None, None)
+    return Coord(
+        sum(value[0] for value in valid) / len(valid),
+        sum(value[1] for value in valid) / len(valid),
+    )
+
+
+def geo_route_penalty(coords: list[Coord]) -> float:
     if len(coords) < 3:
         return 0.0
     penalty = 0.0
-    for i in range(1, len(coords) - 1):
-        prev_c, curr_c, next_c = coords[i - 1], coords[i], coords[i + 1]
+    for index in range(1, len(coords) - 1):
+        prev_c, curr_c, next_c = coords[index - 1], coords[index], coords[index + 1]
         if any(c.lat is None or c.lng is None for c in (prev_c, curr_c, next_c)):
             continue
         dlat_in = curr_c.lat - prev_c.lat  # type: ignore[operator]
@@ -208,690 +314,922 @@ def _geo_zigzag_penalty(coords: list[Coord]) -> float:
     return penalty
 
 
-def _route_geo_penalty(
-    start_coord: Coord,
-    day_points: list[PointIn],
-    ordering: list[int],
-    end_coord: Coord,
-) -> float:
-    coords: list[Coord] = [start_coord]
-    for idx in ordering:
-        coords.append(coord_of(day_points[idx]))
-    coords.append(end_coord)
-    return _geo_zigzag_penalty(coords)
+def is_weekend(day_value: date) -> bool:
+    return day_value.weekday() >= 5
 
 
-def _arrival_anchor(req: SolveRequest) -> Anchor | None:
+def queue_minutes_for_day(point: PointIn, day_value: date) -> int:
+    profile = point.queueProfileJson
+    if profile is None:
+        return 0
+    if is_weekend(day_value) and profile.weekendMinutes is not None:
+        return profile.weekendMinutes
+    if profile.weekdayMinutes is not None:
+        return profile.weekdayMinutes
+    if profile.holidayMinutes is not None:
+        return profile.holidayMinutes
+    return 0
+
+
+def weekday_periods(point: PointIn, day_value: date) -> list[tuple[int, int]]:
+    weekday = day_value.weekday()
+    periods: list[tuple[int, int]] = []
+    if point.pointType == "restaurant" and point.mealTimeWindowsJson:
+        for item in point.mealTimeWindowsJson:
+            periods.append((parse_hhmm(item.start), parse_hhmm(item.end)))
+        return sorted(periods)
+    for rule in point.openingHoursJson:
+        if rule.weekday != weekday:
+            continue
+        for period in rule.periods:
+            periods.append((parse_hhmm(period.start), parse_hhmm(period.end)))
+    return sorted(periods)
+
+
+def day_is_closed(point: PointIn, day_value: date) -> bool:
+    if day_value in point.specialClosureDates:
+        return True
+    return len(weekday_periods(point, day_value)) == 0
+
+
+def restaurant_window_for_slot(point: PointIn, slot: str) -> tuple[int, int] | None:
+    for item in point.mealTimeWindowsJson:
+        if item.mealSlot == slot:
+            return parse_hhmm(item.start), parse_hhmm(item.end)
+    return MEAL_SLOT_WINDOWS.get(slot)
+
+
+def required_meal_slots(req: SolveRequest) -> list[str]:
+    if req.mealPolicy != "auto":
+        return []
+    if req.paceMode == "light":
+        return ["lunch"]
+    return ["lunch", "dinner"]
+
+
+def validate_request(req: SolveRequest) -> None:
+    if req.transportPreference not in ("transit_first", "driving_first", "mixed"):
+        raise HTTPException(status_code=400, detail="unsupported transportPreference")
+    if req.hotelMode == "single" and len(req.hotels) == 0:
+        raise HTTPException(status_code=400, detail="single hotel mode requires hotels")
+
+
+def filter_hotels(req: SolveRequest) -> list[HotelPrepared]:
+    prepared = [
+        HotelPrepared(
+            hotel=item,
+            arrival_coord=hotel_arrival_coord(item),
+            departure_coord=hotel_departure_coord(item),
+        )
+        for item in req.hotels
+        if item.foreignerFriendly and item.bookingStatus != "sold_out"
+    ]
+    if not prepared:
+        raise HTTPException(status_code=400, detail="no eligible hotels after foreigner/availability filtering")
+    return prepared
+
+
+def prepare_points(req: SolveRequest) -> list[PointPrepared]:
+    prepared = [
+        PointPrepared(
+            point=item,
+            arrival_coord=point_arrival_coord(item),
+            departure_coord=point_departure_coord(item),
+        )
+        for item in req.points
+    ]
+    for item in prepared:
+        if item.arrival_coord.lat is None or item.arrival_coord.lng is None:
+            raise HTTPException(status_code=400, detail=f"point {item.point.id} missing arrival coordinate")
+        if item.departure_coord.lat is None or item.departure_coord.lng is None:
+            raise HTTPException(status_code=400, detail=f"point {item.point.id} missing departure coordinate")
+    return prepared
+
+
+def arrival_anchor(req: SolveRequest) -> Anchor | None:
     if req.arrivalAirport is None:
         return None
-    return Anchor(
-        req.arrivalAirportId or "__arrival_airport__",
-        Coord(req.arrivalAirport.latitude, req.arrivalAirport.longitude),
-    )
+    coord = Coord(req.arrivalAirport.latitude, req.arrivalAirport.longitude)
+    return Anchor(req.arrivalAirportId or "__arrival_airport__", coord, coord)
 
 
-def _departure_anchor(req: SolveRequest) -> Anchor | None:
+def departure_anchor(req: SolveRequest) -> Anchor | None:
     if req.departureAirport is None:
         return None
-    return Anchor(
-        req.departureAirportId or "__departure_airport__",
-        Coord(req.departureAirport.latitude, req.departureAirport.longitude),
+    coord = Coord(req.departureAirport.latitude, req.departureAirport.longitude)
+    return Anchor(req.departureAirportId or "__departure_airport__", coord, coord)
+
+
+def build_lookup_maps(rows: list[DistanceMatrixRowIn]) -> LookupMaps:
+    transit: dict[tuple[str, str], int] = {}
+    driving: dict[tuple[str, str], int] = {}
+    walking_meters: dict[tuple[str, str], int] = {}
+    walking_minutes: dict[tuple[str, str], int] = {}
+    distance_km: dict[tuple[str, str], float] = {}
+    transit_summary: dict[tuple[str, str], str] = {}
+
+    for row in rows:
+        key = (row.fromPointId, row.toPointId)
+        if key not in transit or row.transitMinutes < transit[key]:
+            transit[key] = row.transitMinutes
+        if key not in driving or row.drivingMinutes < driving[key]:
+            driving[key] = row.drivingMinutes
+        if key not in walking_meters or row.walkingMeters < walking_meters[key]:
+            walking_meters[key] = row.walkingMeters
+        row_walking_minutes = row.walkingMinutes or max(1, int(round(row.walkingMeters / WALK_SPEED_M_PER_MIN)))
+        if key not in walking_minutes or row_walking_minutes < walking_minutes[key]:
+            walking_minutes[key] = row_walking_minutes
+        if key not in distance_km or row.distanceKm < distance_km[key]:
+            distance_km[key] = row.distanceKm
+        if row.transitSummary:
+            transit_summary[key] = row.transitSummary
+
+    return LookupMaps(
+        transit=transit,
+        driving=driving,
+        walking_meters=walking_meters,
+        walking_minutes=walking_minutes,
+        distance_km=distance_km,
+        transit_summary=transit_summary,
     )
 
 
-def _centroid(coords: list[Coord]) -> Coord:
-    """计算多个坐标的质心（忽略 None）"""
-    valid = [(c.lat, c.lng) for c in coords if c.lat is not None and c.lng is not None]
-    if not valid:
-        return Coord(None, None)
-    avg_lat = sum(v[0] for v in valid) / len(valid)
-    avg_lng = sum(v[1] for v in valid) / len(valid)
-    return Coord(avg_lat, avg_lng)
+def lookup_mode_minutes(
+    mode: Literal["walking", "transit", "driving"],
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
+    lookups: LookupMaps,
+) -> tuple[int, bool, str | None]:
+    if from_id and to_id:
+        key = (from_id, to_id)
+        reverse = (to_id, from_id)
+        if mode == "walking":
+            value = lookups.walking_minutes.get(key) or lookups.walking_minutes.get(reverse)
+            if value is not None:
+                return value, False, None
+        elif mode == "transit":
+            value = lookups.transit.get(key) or lookups.transit.get(reverse)
+            if value is not None:
+                return value, False, lookups.transit_summary.get(key) or lookups.transit_summary.get(reverse)
+        else:
+            value = lookups.driving.get(key) or lookups.driving.get(reverse)
+            if value is not None:
+                return value, False, None
+
+    if mode == "walking":
+        return fallback_walking_minutes(from_coord, to_coord), True, None
+    if mode == "transit":
+        return fallback_transit_minutes(from_coord, to_coord), True, None
+    return fallback_driving_minutes(from_coord, to_coord), True, None
 
 
-# ═══════════════════════════════════════════════════════════
-# 矩阵完整性审计
-# ═══════════════════════════════════════════════════════════
+def lookup_walking_distance(
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
+    lookups: LookupMaps,
+) -> int:
+    if from_id and to_id:
+        return (
+            lookups.walking_meters.get((from_id, to_id))
+            or lookups.walking_meters.get((to_id, from_id))
+            or fallback_walking_meters(from_coord, to_coord)
+        )
+    return fallback_walking_meters(from_coord, to_coord)
 
-MAX_MISSING_UNDIRECTED_RATIO = 0.0
 
-
-def audit_matrix_completeness(
+def lookup_travel_choice(
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
     req: SolveRequest,
-    lookup: dict[tuple[str, str], int],
-) -> None:
-    node_ids: list[str] = []
-    node_ids.extend(p.id for p in req.points)
-    node_ids.extend(h.id for h in req.hotels)
-    arrival = _arrival_anchor(req)
-    departure = _departure_anchor(req)
-    if arrival and arrival.node_id:
-        node_ids.append(arrival.node_id)
-    if departure and departure.node_id and departure.node_id != (
-        arrival.node_id if arrival else None
-    ):
-        node_ids.append(departure.node_id)
+    lookups: LookupMaps,
+) -> EdgeChoice:
+    walking_distance = lookup_walking_distance(from_id, from_coord, to_id, to_coord, lookups)
+    walking_minutes, walking_fallback, _ = lookup_mode_minutes("walking", from_id, from_coord, to_id, to_coord, lookups)
+    transit_minutes, transit_fallback, transit_summary = lookup_mode_minutes("transit", from_id, from_coord, to_id, to_coord, lookups)
+    driving_minutes, driving_fallback, _ = lookup_mode_minutes("driving", from_id, from_coord, to_id, to_coord, lookups)
 
-    unique_ids = list(dict.fromkeys(node_ids))
-    n = len(unique_ids)
-    if n <= 1:
-        return
+    if 0 < walking_distance <= WALK_THRESHOLD_METERS:
+        return EdgeChoice(minutes=walking_minutes, mode="walking", used_fallback=walking_fallback)
+    if req.transportPreference == "transit_first":
+        return EdgeChoice(minutes=transit_minutes, mode="transit", used_fallback=transit_fallback, summary=transit_summary)
+    if req.transportPreference == "driving_first":
+        return EdgeChoice(minutes=driving_minutes, mode="driving", used_fallback=driving_fallback)
+    if transit_minutes <= driving_minutes:
+        return EdgeChoice(minutes=transit_minutes, mode="transit", used_fallback=transit_fallback, summary=transit_summary)
+    return EdgeChoice(minutes=driving_minutes, mode="driving", used_fallback=driving_fallback)
 
-    total_pairs = 0
-    present_pairs = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            total_pairs += 1
-            a, b = unique_ids[i], unique_ids[j]
-            if (a, b) in lookup or (b, a) in lookup:
-                present_pairs += 1
 
-    if total_pairs == 0:
-        return
+def directed_driving_minutes(
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
+    lookups: LookupMaps,
+) -> int:
+    minutes, _, _ = lookup_mode_minutes("driving", from_id, from_coord, to_id, to_coord, lookups)
+    return minutes
 
-    missing_ratio = 1.0 - (present_pairs / total_pairs)
-    if missing_ratio > MAX_MISSING_UNDIRECTED_RATIO:
+
+def build_day_windows(req: SolveRequest) -> list[DayWindow]:
+    pace_start, pace_end, _ = PACE_MODE_WINDOWS[req.paceMode]
+    start_minutes = parse_hhmm(pace_start)
+    end_minutes = parse_hhmm(pace_end)
+    arrival_buffer = req.arrivalAirportBufferMinutes or req.airportBufferMinutes
+
+    windows: list[DayWindow] = []
+    base_date = req.arrivalDateTime.date()
+    for calendar_index in range(req.maxDays):
+        day_value = base_date + timedelta(days=calendar_index)
+        day_start = start_minutes
+        day_end = end_minutes
+        if calendar_index == 0:
+            arrival_minutes = req.arrivalDateTime.hour * 60 + req.arrivalDateTime.minute
+            day_start = max(day_start, arrival_minutes + arrival_buffer)
+        windows.append(
+            DayWindow(
+                calendar_index=calendar_index,
+                date_value=day_value,
+                start_minutes=day_start,
+                end_minutes=day_end,
+            )
+        )
+    return windows
+
+
+def point_day_load(point: PointIn, day_value: date) -> int:
+    return point.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES + queue_minutes_for_day(point, day_value)
+
+
+def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
+    if window.end_minutes <= window.start_minutes:
+        return False
+    if day_is_closed(point, window.date_value):
+        return False
+    if point.pointType == "restaurant" and (not point.mealSlots or not point.mealTimeWindowsJson):
+        return False
+    if point.pointType == "spot" and not point.lastEntryTime:
+        return False
+    # Check lastEntryTime: if day starts at or after lastEntry, this spot can never be entered
+    if point.lastEntryTime:
+        last_entry = parse_hhmm(point.lastEntryTime)
+        if window.start_minutes >= last_entry:
+            return False
+    # Check that the point can actually complete within some opening period on this day
+    load = point_day_load(point, window.date_value)
+    periods = weekday_periods(point, window.date_value)
+    if periods:
+        last_entry_min = parse_hhmm(point.lastEntryTime) if point.lastEntryTime else None
+        for period_start, period_end in periods:
+            earliest_start = max(window.start_minutes, period_start)
+            if last_entry_min is not None and earliest_start > last_entry_min:
+                continue
+            if earliest_start + load <= min(period_end, window.end_minutes):
+                return True
+        return False
+    return load <= (window.end_minutes - window.start_minutes)
+
+
+def effective_day_capacity(req: SolveRequest, n_points: int, has_food: bool) -> int:
+    base = PACE_MODE_WINDOWS[req.paceMode][2]
+    if req.mealPolicy == "auto" and not has_food:
+        base -= len(required_meal_slots(req)) * MEAL_OVERHEAD_MINUTES
+    base -= (n_points + 1) * TRAVEL_OVERHEAD_PER_POINT
+    return max(120, base)
+
+
+def cluster_has_food(cluster: list[int], points: list[PointPrepared]) -> bool:
+    for index in cluster:
+        point = points[index].point
+        if point.hasFoodCourt:
+            return True
+        if point.pointType == "restaurant" and any(slot in ("lunch", "dinner") for slot in point.mealSlots):
+            return True
+    return False
+
+
+def pick_seed(candidates: list[int], points: list[PointPrepared], lookups: LookupMaps) -> int:
+    best_index = candidates[0]
+    best_cost = float("inf")
+    for index in candidates:
+        total = 0
+        for other in candidates:
+            if other == index:
+                continue
+            total += directed_driving_minutes(
+                points[index].point.id,
+                points[index].departure_coord,
+                points[other].point.id,
+                points[other].arrival_coord,
+                lookups,
+            )
+        if total < best_cost:
+            best_cost = total
+            best_index = index
+    return best_index
+
+
+def pick_nearest_to_cluster(
+    candidates: list[int],
+    cluster: list[int],
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+) -> int:
+    best_index = candidates[0]
+    best_cost = float("inf")
+    for index in candidates:
+        total = 0.0
+        for cluster_index in cluster:
+            total += directed_driving_minutes(
+                points[cluster_index].point.id,
+                points[cluster_index].departure_coord,
+                points[index].point.id,
+                points[index].arrival_coord,
+                lookups,
+            )
+        avg = total / max(1, len(cluster))
+        if avg < best_cost:
+            best_cost = avg
+            best_index = index
+    return best_index
+
+
+def cluster_points_to_days(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+    windows: list[DayWindow],
+) -> list[tuple[DayWindow, list[int]]]:
+    """Returns list of (window, point_indexes) pairs.
+    Skipped windows (no available points) are excluded, so the returned list
+    may be shorter than windows and may start from a later calendar day."""
+    unassigned = list(range(len(points)))
+    day_clusters: list[tuple[DayWindow, list[int]]] = []
+
+    for window in windows:
+        if not unassigned:
+            break
+        available_today = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
+        if not available_today:
+            continue
+
+        seed = pick_seed(available_today, points, lookups)
+        cluster = [seed]
+        unassigned.remove(seed)
+        cluster_load = point_day_load(points[seed].point, window.date_value)
+
+        while True:
+            candidates = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
+            if not candidates:
+                break
+            next_index = pick_nearest_to_cluster(candidates, cluster, points, lookups)
+            has_food = cluster_has_food(cluster + [next_index], points)
+            capacity = effective_day_capacity(req, len(cluster) + 1, has_food)
+            next_load = point_day_load(points[next_index].point, window.date_value)
+            if cluster_load + next_load > capacity:
+                break
+            cluster.append(next_index)
+            unassigned.remove(next_index)
+            cluster_load += next_load
+
+        if cluster:
+            day_clusters.append((window, cluster))
+
+    if unassigned:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Distance matrix incomplete: {present_pairs}/{total_pairs} pairs "
-                f"({missing_ratio:.1%} missing)."
-            ),
+            detail={
+                "code": "POINTS_EXCEED_MAX_DAYS",
+                "message": f"{len(unassigned)} point(s) cannot fit within {req.maxDays} days",
+                "remainingPointIds": [points[index].point.id for index in unassigned],
+            },
         )
+    return day_clusters
 
 
-# ═══════════════════════════════════════════════════════════
-# 工具函数
-# ═══════════════════════════════════════════════════════════
-
-def _compute_day_budgets(req: SolveRequest, day_slots: int) -> list[int]:
-    pace_start, pace_end, pace_minutes = PACE_MODE_WINDOWS[req.paceMode]
-    has_restaurant = any(p.pointType == "restaurant" for p in req.points)
-    meal_overhead = 45 if req.mealPolicy == "auto" and not has_restaurant else 0
-    daily_budget = pace_minutes - meal_overhead
-    if daily_budget < 120:
-        raise HTTPException(status_code=400, detail="daily playable minutes too low")
-
-    budgets = [daily_budget] * day_slots
-    if day_slots > 0:
-        budgets[0] = _first_day_budget(
-            req.arrivalDateTime,
-            req.airportBufferMinutes,
-            pace_start,
-            pace_end,
-            pace_minutes,
-            meal_overhead,
-        )
-    return budgets
-
-
-def _first_day_budget(
-    arrival_dt: datetime,
-    buffer_minutes: int,
-    pace_start: str,
-    pace_end: str,
-    pace_minutes: int,
-    meal_overhead: int,
-) -> int:
-    sh, sm = _parse_hhmm(pace_start)
-    eh, em = _parse_hhmm(pace_end)
-    start_dt = arrival_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    end_dt = arrival_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
-    usable_start = max(arrival_dt + timedelta(minutes=buffer_minutes), start_dt)
-    raw = int((end_dt - usable_start).total_seconds() // 60)
-    if raw <= 0:
-        return 0
-    clipped = min(raw, pace_minutes)
-    return max(0, clipped - meal_overhead)
-
-
-# ═══════════════════════════════════════════════════════════
-# Stage 1: 纯点位分天（不含酒店）
-# ═══════════════════════════════════════════════════════════
-
-@dataclass
-class Stage1Result:
-    """每天的点位索引列表，以及对应的日历偏移"""
-    day_point_indexes: list[list[int]]   # pos → [point_index, ...]
-    used_calendar_days: list[int]         # pos → calendar day offset
-    solver_status: Literal["OPTIMAL", "FEASIBLE"]
-
-
-def stage1_assign_points_to_days(
-    req: SolveRequest,
-    lookup: dict[tuple[str, str], int],
-) -> Stage1Result:
-    """
-    Stage 1: 纯 CP-SAT 地理聚类。
-    目标：最少天数，然后最小化每天内点位间通勤代理和。
-    完全不涉及酒店——酒店由 Stage 2 独立决定。
-    """
-    n = len(req.points)
-    d = min(n + 1, req.maxDays + 1)
-
-    pace_start, pace_end, pace_minutes = PACE_MODE_WINDOWS[req.paceMode]
-    has_restaurant = any(p.pointType == "restaurant" for p in req.points)
-    meal_overhead = 45 if req.mealPolicy == "auto" and not has_restaurant else 0
-    daily_budget = pace_minutes - meal_overhead
-    if daily_budget < 120:
-        raise HTTPException(status_code=400, detail="daily playable minutes too low")
-
-    first_budget = _first_day_budget(
-        req.arrivalDateTime,
-        req.airportBufferMinutes,
-        pace_start, pace_end,
-        pace_minutes, meal_overhead,
-    )
-
-    point_loads = [p.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES for p in req.points]
-    if any(load > daily_budget for load in point_loads):
-        raise HTTPException(status_code=400, detail="at least one point duration exceeds daily budget")
-
-    model = cp_model.CpModel()
-
-    x = [[model.NewBoolVar(f"x_{i}_{day}") for day in range(d)] for i in range(n)]
-    for i in range(n):
-        model.Add(sum(x[i]) == 1)
-
-    used = [model.NewBoolVar(f"u_{day}") for day in range(d)]
-    day_budgets = [daily_budget] * d
-    day_budgets[0] = first_budget
-
-    for day in range(d):
-        model.Add(
-            sum(point_loads[i] * x[i][day] for i in range(n))
-            <= day_budgets[day] * used[day]
-        )
-        model.Add(sum(x[i][day] for i in range(n)) >= used[day])
-
-    for day in range(1, d - 1):
-        model.Add(used[day] >= used[day + 1])
-
-    model.Add(sum(used) <= req.maxDays)
-
-    used_days_expr = sum(used)
-    # 天序打包惩罚：鼓励点位靠前安排，减少空洞
-    day_pack_penalty = sum(
-        (day + 1) * x[i][day] for i in range(n) for day in range(d)
-    )
-
-    # 核心：同天点位间通勤代理（点对点，与酒店无关）
-    pair_terms: list = []
-    if req.objective in ("min_transit", "min_days_then_transit") and n <= 80:
-        for i in range(n):
-            for j in range(i + 1, n):
-                cost = symmetric(
-                    req.points[i].id, coord_of(req.points[i]),
-                    req.points[j].id, coord_of(req.points[j]),
-                    lookup,
-                )
-                for day in range(d):
-                    y = model.NewBoolVar(f"pair_{i}_{j}_{day}")
-                    model.Add(y <= x[i][day])
-                    model.Add(y <= x[j][day])
-                    model.Add(y >= x[i][day] + x[j][day] - 1)
-                    pair_terms.append(y * cost)
-    transit_proxy = sum(pair_terms)
-
-    solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = 8
-    t1 = max(0.2, req.timeLimitSeconds * 0.45)
-    t2 = max(0.2, req.timeLimitSeconds * 0.45)
-
-    lex_first_status: int | None = None
-
-    if req.objective == "min_days":
-        solver.parameters.max_time_in_seconds = t1 + t2
-        model.Minimize(used_days_expr * 10000 + day_pack_penalty)
-        status = solver.Solve(model)
-    elif req.objective == "min_transit":
-        solver.parameters.max_time_in_seconds = t1 + t2
-        model.Minimize(used_days_expr * 10000 + transit_proxy + day_pack_penalty)
-        status = solver.Solve(model)
-    else:  # min_days_then_transit
-        solver.parameters.max_time_in_seconds = t1
-        model.Minimize(used_days_expr)
-        lex_first_status = solver.Solve(model)
-        if lex_first_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise HTTPException(status_code=503, detail="solver failed phase 1a")
-
-        min_days_found = sum(solver.Value(u) for u in used)
-        if lex_first_status == cp_model.OPTIMAL:
-            model.Add(used_days_expr == min_days_found)
-            model.Minimize(transit_proxy + day_pack_penalty)
-        else:
-            model.Add(used_days_expr <= min_days_found)
-            model.Minimize(used_days_expr * 10000 + transit_proxy + day_pack_penalty)
-
-        solver.parameters.max_time_in_seconds = t2
-        status = solver.Solve(model)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise HTTPException(status_code=503, detail="solver failed to find feasible plan")
-
-    used_day_indexes = [day for day in range(d) if solver.Value(used[day]) == 1]
-    if not used_day_indexes:
-        raise HTTPException(status_code=503, detail="solver returned empty day set")
-
-    day_position_by_index = {day_idx: pos for pos, day_idx in enumerate(used_day_indexes)}
-    day_indexes: list[list[int]] = [[] for _ in range(len(used_day_indexes))]
-
-    for i in range(n):
-        assigned_day = next(
-            (day for day in range(d) if solver.Value(x[i][day]) == 1), None
-        )
-        if assigned_day is None:
-            raise HTTPException(status_code=503, detail="solver assignment invalid")
-        pos = day_position_by_index.get(assigned_day)
-        if pos is None:
-            raise HTTPException(status_code=503, detail="solver day mapping invalid")
-        day_indexes[pos].append(i)
-
-    solver_status: Literal["OPTIMAL", "FEASIBLE"] = "OPTIMAL"
-    if status != cp_model.OPTIMAL:
-        solver_status = "FEASIBLE"
-    if req.objective == "min_days_then_transit" and lex_first_status == cp_model.FEASIBLE:
-        solver_status = "FEASIBLE"
-
-    return Stage1Result(
-        day_point_indexes=day_indexes,
-        used_calendar_days=used_day_indexes,
-        solver_status=solver_status,
-    )
-
-
-# ═══════════════════════════════════════════════════════════
-# Stage 2: 基于天质心的酒店分配
-# ═══════════════════════════════════════════════════════════
-
-@dataclass
-class Stage2Result:
-    hotel_ids: list[str]
-
-
-def _day_centroid(point_indexes: list[int], req: SolveRequest) -> Coord:
-    """计算某天所有点位的地理质心"""
-    coords = [coord_of(req.points[i]) for i in point_indexes]
-    return _centroid(coords)
-
-
-def _hotel_to_day_cost(
-    hotel: HotelIn,
+def find_nearest_hotel(
     point_indexes: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    lookups: LookupMaps,
+) -> int:
+    best_hotel = 0
+    best_cost = float("inf")
+    for hotel_index, hotel in enumerate(hotels):
+        total = 0.0
+        for point_index in point_indexes:
+            to_point = directed_driving_minutes(
+                hotel.hotel.id,
+                hotel.departure_coord,
+                points[point_index].point.id,
+                points[point_index].arrival_coord,
+                lookups,
+            )
+            from_point = directed_driving_minutes(
+                points[point_index].point.id,
+                points[point_index].departure_coord,
+                hotel.hotel.id,
+                hotel.arrival_coord,
+                lookups,
+            )
+            total += to_point + from_point
+        avg = total / max(1, len(point_indexes))
+        if avg < best_cost:
+            best_cost = avg
+            best_hotel = hotel_index
+    return best_hotel
+
+
+def assign_hotel_per_day(
+    day_clusters: list[tuple[DayWindow, list[int]]],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    lookups: LookupMaps,
     req: SolveRequest,
-    lookup: dict[tuple[str, str], int],
-) -> float:
-    """
-    计算酒店对某天点位集合的服务成本。
-    使用"酒店到质心距离"作为代理，同时加权实际通勤矩阵数据。
-    成本 = sum(directed(hotel→point)) + sum(directed(point→hotel))
-    近似实际路线 hotel→p1→...→hotel 中酒店段的双向成本。
-    """
-    total = 0.0
-    h_coord = coord_of(hotel)
-    for i in point_indexes:
-        p = req.points[i]
-        p_coord = coord_of(p)
-        total += directed(hotel.id, h_coord, p.id, p_coord, lookup)
-        total += directed(p.id, p_coord, hotel.id, h_coord, lookup)
-    return total
-
-
-def stage2_assign_hotels(
-    req: SolveRequest,
-    s1: Stage1Result,
-    lookup: dict[tuple[str, str], int],
-) -> Stage2Result:
-    """
-    Stage 2: 解耦酒店分配。
-    策略：
-    1. 计算每天所有点位的地理质心
-    2. 若 hotelMode == 'single'：找对所有天总成本最低的单一酒店
-    3. 若 hotelMode == 'multi'：
-       a. 为每天独立选最优酒店（最小化当天路线成本）
-       b. 应用连续天切换惩罚（与酒店切换距离成正比）
-       c. 用 DP 在"保留同一家" vs "切换到更好的" 之间权衡
-    """
-    num_days = len(s1.day_point_indexes)
-    hotels = req.hotels
-    k = len(hotels)
-
-    if num_days == 0 or k == 0:
-        raise HTTPException(status_code=503, detail="no days or hotels")
-
-    # 预计算每个 (天, 酒店) 的成本
-    day_hotel_cost: list[list[float]] = []
-    for pos in range(num_days):
-        row: list[float] = []
-        for hotel in hotels:
-            cost = _hotel_to_day_cost(hotel, s1.day_point_indexes[pos], req, lookup)
-            row.append(cost)
-        day_hotel_cost.append(row)
-
+) -> list[int]:
+    clusters_only = [cluster for _, cluster in day_clusters]
     if req.hotelMode == "single":
-        # 选总成本最低的单一酒店
-        best_h = min(range(k), key=lambda h: sum(day_hotel_cost[pos][h] for pos in range(num_days)))
-        return Stage2Result(hotel_ids=[hotels[best_h].id] * num_days)
-
-    # multi 模式：DP
-    # state: (pos, last_hotel_idx) → min_total_cost
-    INF = float("inf")
-    dp: list[list[float]] = [[INF] * k for _ in range(num_days)]
-    back: list[list[int]] = [[-1] * k for _ in range(num_days)]
-
-    # 初始化第 0 天
-    for h in range(k):
-        dp[0][h] = day_hotel_cost[0][h]
-
-    # 酒店切换惩罚（分钟）：来自 req 参数，可由调用方配置
-    switch_penalty = float(req.switchPenaltyMinutes)  # 默认 45 分钟
-
-    # 用质心间距离动态决定是否值得换酒店
-    # 如果两天质心距离 > HOTEL_SWITCH_DISTANCE_KM，换酒店的惩罚折半（距离远，换酒店合理）
-    day_centroids = [
-        _day_centroid(s1.day_point_indexes[pos], req)
-        for pos in range(num_days)
-    ]
-
-    for pos in range(1, num_days):
-        centroid_dist = haversine_km(day_centroids[pos - 1], day_centroids[pos])
-        # 两天质心距离越远，切换酒店的惩罚越低
-        switch_factor = 0.3 if centroid_dist >= HOTEL_SWITCH_DISTANCE_KM else 1.0
-
-        for h in range(k):
-            best_prev_cost = INF
-            best_prev_h = -1
-            for prev_h in range(k):
-                if dp[pos - 1][prev_h] >= INF:
-                    continue
-                is_switch = int(prev_h != h)
-                cost = dp[pos - 1][prev_h] + is_switch * switch_penalty * switch_factor
-                if cost < best_prev_cost:
-                    best_prev_cost = cost
-                    best_prev_h = prev_h
-            if best_prev_cost < INF:
-                dp[pos][h] = best_prev_cost + day_hotel_cost[pos][h]
-                back[pos][h] = best_prev_h
-
-    # 回溯最优路径
-    last_h = min(range(k), key=lambda h: dp[num_days - 1][h])
-    if dp[num_days - 1][last_h] >= INF:
-        # 降级：每天选最近酒店
-        hotel_ids = [
-            hotels[min(range(k), key=lambda h: day_hotel_cost[pos][h])].id
-            for pos in range(num_days)
-        ]
-        return Stage2Result(hotel_ids=hotel_ids)
-
-    path = [-1] * num_days
-    path[-1] = last_h
-    for pos in range(num_days - 1, 0, -1):
-        path[pos - 1] = back[pos][path[pos]]
-
-    return Stage2Result(hotel_ids=[hotels[h].id for h in path])
+        all_point_indexes = [index for cluster in clusters_only for index in cluster]
+        best = find_nearest_hotel(all_point_indexes, points, hotels, lookups)
+        return [best] * len(clusters_only)
+    return [find_nearest_hotel(cluster, points, hotels, lookups) for cluster in clusters_only]
 
 
-# ═══════════════════════════════════════════════════════════
-# Stage 3: 日内 TSP 排序（与原版相同）
-# ═══════════════════════════════════════════════════════════
-
-@dataclass
-class DayRoute:
-    ordering: list[int]
-    cost: int
-    effective_cost: float
-
-
-def _nn_order(
-    day_points: list[PointIn],
-    start_id: str,
-    start_coord: Coord,
-    end_hotel_id: str,
-    end_hotel_coord: Coord,
-    lookup: dict[tuple[str, str], int],
-) -> DayRoute:
-    m = len(day_points)
-    if m == 0:
-        c = directed(start_id, start_coord, end_hotel_id, end_hotel_coord, lookup)
-        return DayRoute([], c, float(c))
-
-    remaining = set(range(m))
-    ordering: list[int] = []
-    first = min(
-        remaining,
-        key=lambda i: directed(
-            start_id, start_coord, day_points[i].id, coord_of(day_points[i]), lookup
-        ),
-    )
-    ordering.append(first)
-    remaining.remove(first)
-
-    while remaining:
-        current_point = day_points[ordering[-1]]
-        next_idx = min(
-            remaining,
-            key=lambda i: directed(
-                current_point.id, coord_of(current_point),
-                day_points[i].id, coord_of(day_points[i]),
-                lookup,
-            ),
-        )
-        ordering.append(next_idx)
-        remaining.remove(next_idx)
-
-    cost = directed(start_id, start_coord, day_points[ordering[0]].id, coord_of(day_points[ordering[0]]), lookup)
-    for k_idx in range(m - 1):
-        a, b = day_points[ordering[k_idx]], day_points[ordering[k_idx + 1]]
-        cost += directed(a.id, coord_of(a), b.id, coord_of(b), lookup)
-    cost += directed(day_points[ordering[-1]].id, coord_of(day_points[ordering[-1]]), end_hotel_id, end_hotel_coord, lookup)
-
-    geo_pen = _route_geo_penalty(start_coord, day_points, ordering, end_hotel_coord)
-    return DayRoute(ordering, cost, cost + geo_pen)
+def opening_period_for_arrival(point: PointIn, day_value: date, arrival_minutes: int) -> tuple[int, int] | None:
+    periods = weekday_periods(point, day_value)
+    last_entry = parse_hhmm(point.lastEntryTime) if point.lastEntryTime else None
+    for period_start, period_end in periods:
+        start_candidate = max(arrival_minutes, period_start)
+        if last_entry is not None and start_candidate > last_entry:
+            continue
+        return start_candidate, period_end
+    return None
 
 
-def _precompute_day_exact(
-    day_points: list[PointIn],
-    start_ids: list[str],
-    hotels: list[HotelIn],
-    coord_map: dict[str, Coord],
-    lookup: dict[tuple[str, str], int],
-) -> dict[tuple[str, str], DayRoute]:
-    m = len(day_points)
-    routes: dict[tuple[str, str], DayRoute] = {}
+def maybe_insert_virtual_meal_soft(
+    current_minutes: int,
+    slot: str,
+    satisfied: set[str],
+    day_end_minutes: int,
+) -> tuple[int, bool, float]:
+    if slot in satisfied:
+        return current_minutes, False, 0.0
+    slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
+    meal_start = max(current_minutes, slot_start)
+    meal_end = meal_start + VIRTUAL_MEAL_MINUTES
+    if meal_end > min(slot_end, day_end_minutes):
+        return current_minutes, False, float(MEAL_MISS_PENALTY_MINUTES)
+    satisfied.add(slot)
+    return meal_end, True, 0.0
 
-    if m == 0:
-        for start_id in start_ids:
-            start_coord = coord_map[start_id]
-            for hotel in hotels:
-                c = directed(start_id, start_coord, hotel.id, coord_of(hotel), lookup)
-                routes[(start_id, hotel.id)] = DayRoute([], c, float(c))
-        return routes
 
-    if m == 1:
-        only = day_points[0]
-        for start_id in start_ids:
-            start_coord = coord_map[start_id]
-            for hotel in hotels:
-                in_cost = directed(start_id, start_coord, only.id, coord_of(only), lookup)
-                out_cost = directed(only.id, coord_of(only), hotel.id, coord_of(hotel), lookup)
-                c = in_cost + out_cost
-                routes[(start_id, hotel.id)] = DayRoute([0], c, float(c))
-        return routes
+def extract_http_detail_message(detail: object) -> str:
+    if isinstance(detail, dict):
+        for key in ("message", "reason", "detail"):
+            value = detail.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return str(detail)
+    if isinstance(detail, str):
+        return detail
+    return str(detail)
 
-    # 枚举所有排列，按 (first, last) 分组保留最优内路线
-    best_inner: dict[tuple[int, int], tuple[int, list[int]]] = {}
-    for perm in itertools.permutations(range(m)):
-        order = list(perm)
-        inner_cost = sum(
-            directed(
-                day_points[order[k_idx]].id, coord_of(day_points[order[k_idx]]),
-                day_points[order[k_idx + 1]].id, coord_of(day_points[order[k_idx + 1]]),
-                lookup,
+
+def build_no_feasible_ordering_detail(route_points: list[PointPrepared], failure_messages: list[str]) -> dict[str, object]:
+    counts: dict[str, int] = {}
+    for message in failure_messages:
+        counts[message] = counts.get(message, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return {
+        "code": "NO_FEASIBLE_ORDERING_FOR_DAY",
+        "message": "no feasible ordering for day",
+        "reason": ranked[0][0] if ranked else "unknown ordering failure",
+        "orderingAttempts": len(failure_messages),
+        "pointIds": [item.point.id for item in route_points],
+        "reasonSummary": [{"reason": reason, "count": count} for reason, count in ranked[:5]],
+    }
+
+
+def evaluate_order(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    day_window: DayWindow,
+    hotel_index: int,
+    day_point_indexes: list[int],
+    ordering: list[int],
+    lookups: LookupMaps,
+    start_anchor: Anchor,
+    previous_hotel_index: int | None,
+    is_last_day: bool,
+) -> EvaluatedRoute:
+    hotel = hotels[hotel_index]
+    route_points = [points[day_point_indexes[index]] for index in ordering]
+    day_end_limit = day_window.end_minutes
+    if is_last_day and req.departureAirportBufferMinutes:
+        day_end_limit = max(day_window.start_minutes, day_end_limit - req.departureAirportBufferMinutes)
+
+    current_time = day_window.start_minutes
+    current_id = start_anchor.node_id
+    current_coord = start_anchor.departure
+    satisfied_meals: set[str] = set()
+    required_meals = required_meal_slots(req)
+    transport_modes = {"walking": 0, "transit": 0, "driving": 0}
+    queue_total = 0
+    travel_total = 0
+    wait_total = 0
+    fallback_edges = 0
+    virtual_meal_total = 0
+    meal_penalty = 0.0
+
+    for route_point in route_points:
+        point = route_point.point
+        choice = lookup_travel_choice(current_id, current_coord, point.id, route_point.arrival_coord, req, lookups)
+        tentative_time = current_time + choice.minutes
+
+        for slot in required_meals:
+            if slot in satisfied_meals:
+                continue
+            slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
+            point_can_cover_slot = (
+                (point.pointType == "restaurant" and slot in (point.mealSlots or []))
+                or (point.hasFoodCourt and slot in ("lunch", "dinner"))
             )
-            for k_idx in range(m - 1)
-        )
-        key = (order[0], order[-1])
-        current = best_inner.get(key)
-        if current is None or inner_cost < current[0]:
-            best_inner[key] = (inner_cost, order)
-
-    start_to_first: dict[tuple[str, int], int] = {
-        (start_id, point_idx): directed(
-            start_id, coord_map[start_id],
-            day_points[point_idx].id, coord_of(day_points[point_idx]),
-            lookup,
-        )
-        for start_id in start_ids
-        for point_idx in range(m)
-    }
-    last_to_hotel: dict[tuple[int, str], int] = {
-        (point_idx, hotel.id): directed(
-            day_points[point_idx].id, coord_of(day_points[point_idx]),
-            hotel.id, coord_of(hotel), lookup,
-        )
-        for point_idx in range(m)
-        for hotel in hotels
-    }
-
-    for start_id in start_ids:
-        start_coord = coord_map[start_id]
-        for hotel in hotels:
-            hotel_coord = coord_of(hotel)
-            best_eff: float | None = None
-            best_cost: int = 0
-            best_perm: list[int] = next(iter(best_inner.values()))[1]
-
-            for (first_idx, last_idx), (inner_cost, perm) in best_inner.items():
-                transit_cost = (
-                    start_to_first[(start_id, first_idx)]
-                    + inner_cost
-                    + last_to_hotel[(last_idx, hotel.id)]
+            if not point_can_cover_slot and tentative_time > slot_end:
+                current_time, inserted, penalty = maybe_insert_virtual_meal_soft(
+                    current_time,
+                    slot,
+                    satisfied_meals,
+                    day_end_limit,
                 )
-                geo_pen = _route_geo_penalty(start_coord, day_points, perm, hotel_coord)
-                eff = transit_cost + geo_pen
-                if best_eff is None or eff < best_eff:
-                    best_eff = eff
-                    best_cost = transit_cost
-                    best_perm = perm
+                if inserted:
+                    virtual_meal_total += VIRTUAL_MEAL_MINUTES
+                meal_penalty += penalty
+                choice = lookup_travel_choice(current_id, current_coord, point.id, route_point.arrival_coord, req, lookups)
+                tentative_time = current_time + choice.minutes
+            elif point_can_cover_slot and tentative_time < slot_start:
+                tentative_time = slot_start
 
-            routes[(start_id, hotel.id)] = DayRoute(list(best_perm), best_cost, best_eff or float(best_cost))
+        transport_modes[choice.mode] += 1
+        travel_total += choice.minutes
+        fallback_edges += int(choice.used_fallback)
+        current_time += choice.minutes
 
-    return routes
+        if day_is_closed(point, day_window.date_value):
+            raise HTTPException(status_code=400, detail=f"point {point.id} closed on scheduled day")
+
+        open_period = opening_period_for_arrival(point, day_window.date_value, current_time)
+        if open_period is None:
+            raise HTTPException(status_code=400, detail=f"point {point.id} has no feasible time window")
+
+        service_start, service_window_end = open_period
+        wait_total += max(0, service_start - current_time)
+        current_time = service_start
+
+        queue_minutes = queue_minutes_for_day(point, day_window.date_value)
+        queue_total += queue_minutes
+        service_end = current_time + point.suggestedDurationMinutes + queue_minutes
+        if service_end > service_window_end or service_end > day_end_limit:
+            raise HTTPException(status_code=400, detail=f"point {point.id} exceeds open window")
+
+        for slot in required_meals:
+            if point.hasFoodCourt and slot in ("lunch", "dinner"):
+                slot_start, slot_end = MEAL_SLOT_WINDOWS[slot]
+                if current_time < slot_end and service_end > slot_start:
+                    satisfied_meals.add(slot)
+                continue
+            if point.pointType != "restaurant" or slot not in point.mealSlots:
+                continue
+            meal_window = restaurant_window_for_slot(point, slot)
+            if meal_window is None:
+                continue
+            slot_start, slot_end = meal_window
+            if current_time < slot_end and service_end > slot_start:
+                satisfied_meals.add(slot)
+
+        current_time = service_end
+        current_id = point.id
+        current_coord = route_point.departure_coord
+
+    for slot in required_meals:
+        if slot in satisfied_meals:
+            continue
+        current_time, inserted, penalty = maybe_insert_virtual_meal_soft(
+            current_time,
+            slot,
+            satisfied_meals,
+            day_end_limit,
+        )
+        if inserted:
+            virtual_meal_total += VIRTUAL_MEAL_MINUTES
+        meal_penalty += penalty
+
+    hotel_choice = lookup_travel_choice(current_id, current_coord, hotel.hotel.id, hotel.arrival_coord, req, lookups)
+    transport_modes[hotel_choice.mode] += 1
+    travel_total += hotel_choice.minutes
+    fallback_edges += int(hotel_choice.used_fallback)
+    current_time += hotel_choice.minutes
+
+    if previous_hotel_index is not None and previous_hotel_index != hotel_index and hotel.hotel.checkInTime is not None:
+        check_in_minutes = parse_hhmm(hotel.hotel.checkInTime)
+        if current_time < check_in_minutes:
+            wait_total += check_in_minutes - current_time
+            current_time = check_in_minutes
+
+    if current_time > day_end_limit:
+        raise HTTPException(status_code=400, detail="day route exceeds day window")
+
+    route_coords = [start_anchor.departure] + [item.arrival_coord for item in route_points] + [hotel.arrival_coord]
+    effective_cost = float(travel_total) + geo_route_penalty(route_coords) + meal_penalty + float(wait_total) * 0.2
+
+    return EvaluatedRoute(
+        ordering=ordering,
+        point_ids=[item.point.id for item in route_points],
+        travel_minutes=travel_total,
+        effective_cost=effective_cost,
+        diagnostics=DayDiagnostics(
+            travel_minutes=travel_total,
+            queue_minutes=queue_total,
+            virtual_meal_minutes=virtual_meal_total,
+            meal_penalty_minutes=meal_penalty,
+            hotel_switch=previous_hotel_index is not None and previous_hotel_index != hotel_index,
+            fallback_edges_used=fallback_edges,
+            transport_modes=transport_modes,
+            meal_status={
+                "required": required_meals,
+                "satisfied": sorted(satisfied_meals),
+                "virtualMealInserted": virtual_meal_total > 0,
+                "penaltyApplied": meal_penalty > 0,
+            },
+            window_wait_minutes=wait_total,
+            route_effective_cost=effective_cost,
+        ),
+        end_time_minutes=current_time,
+    )
 
 
-def stage3_order_points(
+def nearest_neighbor_order(
     req: SolveRequest,
-    s1: Stage1Result,
-    s2: Stage2Result,
-    lookup: dict[tuple[str, str], int],
-) -> list[tuple[list[int], int]]:
-    """
-    Stage 3: 给每天选出最优点位排序。
-    返回 [(ordering, travel_minutes), ...] per day
-    """
-    arrival = _arrival_anchor(req)
-    hotel_by_id = {h.id: h for h in req.hotels}
-    coord_map: dict[str, Coord] = {h.id: coord_of(h) for h in req.hotels}
-    if arrival and arrival.node_id:
-        coord_map[arrival.node_id] = arrival.coord
-
-    results: list[tuple[list[int], int]] = []
-
-    for pos, point_indexes in enumerate(s1.day_point_indexes):
-        hotel_id = s2.hotel_ids[pos]
-        hotel = hotel_by_id[hotel_id]
-        day_points = [req.points[i] for i in point_indexes]
-
-        # 确定当天出发地
-        if pos == 0:
-            if s1.used_calendar_days[0] > 0:
-                start_id = hotel_id
-                start_coord = coord_of(hotel)
-            elif arrival and arrival.node_id:
-                start_id = arrival.node_id
-                start_coord = arrival.coord
-            else:
-                start_id = hotel_id
-                start_coord = coord_of(hotel)
-        else:
-            prev_hotel_id = s2.hotel_ids[pos - 1]
-            prev_hotel = hotel_by_id[prev_hotel_id]
-            start_id = prev_hotel_id
-            start_coord = coord_of(prev_hotel)
-
-        if len(day_points) <= MAX_EXACT_PERMUTATION_SIZE:
-            routes = _precompute_day_exact(
-                day_points,
-                [start_id],
-                [hotel],
-                coord_map,
-                lookup,
-            )
-            route = routes.get((start_id, hotel_id))
-            if route is None:
-                route = _nn_order(day_points, start_id, start_coord, hotel_id, coord_of(hotel), lookup)
-        else:
-            route = _nn_order(day_points, start_id, start_coord, hotel_id, coord_of(hotel), lookup)
-
-        results.append((route.ordering, route.cost))
-
-    return results
+    points: list[PointPrepared],
+    day_point_indexes: list[int],
+    start_anchor: Anchor,
+    lookups: LookupMaps,
+) -> list[int]:
+    if not day_point_indexes:
+        return []
+    remaining = list(day_point_indexes)
+    ordering: list[int] = []
+    current_id = start_anchor.node_id
+    current_coord = start_anchor.departure
+    while remaining:
+        next_point = min(
+            remaining,
+            key=lambda index: lookup_travel_choice(
+                current_id,
+                current_coord,
+                points[index].point.id,
+                points[index].arrival_coord,
+                req,
+                lookups,
+            ).minutes,
+        )
+        ordering.append(day_point_indexes.index(next_point))
+        current_id = points[next_point].point.id
+        current_coord = points[next_point].departure_coord
+        remaining.remove(next_point)
+    return ordering
 
 
-# ═══════════════════════════════════════════════════════════
-# 主求解流程（三段解耦）
-# ═══════════════════════════════════════════════════════════
-
-def solve_three_stage(
+def solve_day_route(
     req: SolveRequest,
-    lookup: dict[tuple[str, str], int],
-) -> SolveResponse:
-    # Stage 1: 纯点位地理聚类
-    s1 = stage1_assign_points_to_days(req, lookup)
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    day_window: DayWindow,
+    hotel_index: int,
+    day_point_indexes: list[int],
+    start_anchor: Anchor,
+    previous_hotel_index: int | None,
+    is_last_day: bool,
+    lookups: LookupMaps,
+) -> EvaluatedRoute:
+    if not day_point_indexes:
+        return evaluate_order(
+            req,
+            points,
+            hotels,
+            day_window,
+            hotel_index,
+            day_point_indexes,
+            [],
+            lookups,
+            start_anchor,
+            previous_hotel_index,
+            is_last_day,
+        )
 
-    # Stage 2: 基于质心的酒店分配
-    s2 = stage2_assign_hotels(req, s1, lookup)
+    if len(day_point_indexes) <= MAX_EXACT_PERMUTATION_SIZE:
+        best: EvaluatedRoute | None = None
+        failures: list[str] = []
+        route_points = [points[day_point_indexes[idx]] for idx in range(len(day_point_indexes))]
+        for ordering in itertools.permutations(range(len(day_point_indexes))):
+            try:
+                candidate = evaluate_order(
+                    req,
+                    points,
+                    hotels,
+                    day_window,
+                    hotel_index,
+                    day_point_indexes,
+                    list(ordering),
+                    lookups,
+                    start_anchor,
+                    previous_hotel_index,
+                    is_last_day,
+                )
+            except HTTPException as exc:
+                failures.append(extract_http_detail_message(exc.detail))
+                continue
+            if best is None or candidate.effective_cost < best.effective_cost:
+                best = candidate
+        if best is None:
+            raise HTTPException(status_code=400, detail=build_no_feasible_ordering_detail(route_points, failures))
+        return best
 
-    # Stage 3: 日内最优排序
-    orderings = stage3_order_points(req, s1, s2, lookup)
+    base_order = nearest_neighbor_order(req, points, day_point_indexes, start_anchor, lookups)
+    return evaluate_order(
+        req,
+        points,
+        hotels,
+        day_window,
+        hotel_index,
+        day_point_indexes,
+        base_order,
+        lookups,
+        start_anchor,
+        previous_hotel_index,
+        is_last_day,
+    )
 
-    # 组装响应
-    start_date = req.arrivalDateTime.date()
+
+def build_start_anchor(
+    req: SolveRequest,
+    hotels: list[HotelPrepared],
+    day_position: int,
+    day_calendar_index: int,
+    hotel_index: int,
+    previous_hotel_index: int | None,
+) -> Anchor:
+    if day_position == 0:
+        arrival = arrival_anchor(req)
+        if day_calendar_index == 0 and arrival is not None:
+            return arrival
+        hotel = hotels[hotel_index]
+        return Anchor(hotel.hotel.id, hotel.departure_coord, hotel.departure_coord)
+    if previous_hotel_index is None:
+        hotel = hotels[hotel_index]
+        return Anchor(hotel.hotel.id, hotel.departure_coord, hotel.departure_coord)
+    previous_hotel = hotels[previous_hotel_index]
+    return Anchor(previous_hotel.hotel.id, previous_hotel.departure_coord, previous_hotel.departure_coord)
+
+
+def build_solver_diagnostics(
+    req: SolveRequest,
+    day_clusters: list[tuple[DayWindow, list[int]]],
+    hotel_indexes: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    day_routes: list[EvaluatedRoute],
+) -> dict[str, object]:
+    total_queue = sum(route.diagnostics.queue_minutes for route in day_routes)
+    total_travel = sum(route.diagnostics.travel_minutes for route in day_routes)
+    total_virtual_meal = sum(route.diagnostics.virtual_meal_minutes for route in day_routes)
+    total_meal_penalty = sum(route.diagnostics.meal_penalty_minutes for route in day_routes)
+    total_fallback = sum(route.diagnostics.fallback_edges_used for route in day_routes)
+    hotel_switches = sum(1 for route in day_routes if route.diagnostics.hotel_switch)
+
+    return {
+        "transportPreference": req.transportPreference,
+        "tripWindowDays": [window.date_value.isoformat() for window, _ in day_clusters],
+        "hotelSwitches": hotel_switches,
+        "totalTravelMinutes": total_travel,
+        "totalQueueMinutes": total_queue,
+        "totalVirtualMealMinutes": total_virtual_meal,
+        "totalMealPenaltyMinutes": total_meal_penalty,
+        "fallbackEdgesUsed": total_fallback,
+        "days": [
+            {
+                "dayNumber": index + 1,
+                "date": window.date_value.isoformat(),
+                "pointIds": [points[point_index].point.id for point_index in cluster],
+                "hotelId": hotels[hotel_indexes[index]].hotel.id,
+                "travelMinutes": route.diagnostics.travel_minutes,
+                "queueMinutes": route.diagnostics.queue_minutes,
+                "virtualMealMinutes": route.diagnostics.virtual_meal_minutes,
+                "mealPenaltyMinutes": route.diagnostics.meal_penalty_minutes,
+                "hotelSwitch": route.diagnostics.hotel_switch,
+                "fallbackEdgesUsed": route.diagnostics.fallback_edges_used,
+                "transportModes": route.diagnostics.transport_modes,
+                "mealStatus": route.diagnostics.meal_status,
+                "windowWaitMinutes": route.diagnostics.window_wait_minutes,
+            }
+            for index, ((window, cluster), route) in enumerate(zip(day_clusters, day_routes))
+        ],
+    }
+
+
+def solve_itinerary(req: SolveRequest) -> SolveResponse:
+    validate_request(req)
+    points = prepare_points(req)
+    hotels = filter_hotels(req)
+    lookups = build_lookup_maps(req.distanceMatrix.rows)
+    windows = build_day_windows(req)
+
+    day_clusters = cluster_points_to_days(req, points, lookups, windows)
+    hotel_per_day = assign_hotel_per_day(day_clusters, points, hotels, lookups, req)
+
     days: list[DayPlan] = []
-    for pos in range(len(s1.day_point_indexes)):
-        calendar_index = s1.used_calendar_days[pos]
-        point_indexes = s1.day_point_indexes[pos]
-        ordering, travel_minutes = orderings[pos]
-        point_ids = [req.points[point_indexes[idx]].id for idx in ordering]
-        days.append(DayPlan(
-            dayNumber=pos + 1,
-            date=(start_date + timedelta(days=calendar_index)).isoformat(),
-            pointIds=point_ids,
-            hotelId=s2.hotel_ids[pos],
-        ))
+    routes: list[EvaluatedRoute] = []
+
+    for day_position, (window, cluster) in enumerate(day_clusters):
+        hotel_index = hotel_per_day[day_position]
+        previous_hotel_index = hotel_per_day[day_position - 1] if day_position > 0 else None
+        start = build_start_anchor(req, hotels, day_position, window.calendar_index, hotel_index, previous_hotel_index)
+        is_last = day_position == len(day_clusters) - 1
+
+        try:
+            route = solve_day_route(
+                req,
+                points,
+                hotels,
+                window,
+                hotel_index,
+                cluster,
+                start,
+                previous_hotel_index,
+                is_last,
+                lookups,
+            )
+        except HTTPException as exc:
+            if exc.status_code != 400:
+                raise
+            req_no_meal = req.model_copy(update={"mealPolicy": "off"})
+            try:
+                route = solve_day_route(
+                    req_no_meal,
+                    points,
+                    hotels,
+                    window,
+                    hotel_index,
+                    cluster,
+                    start,
+                    previous_hotel_index,
+                    is_last,
+                    lookups,
+                )
+            except HTTPException:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "NO_FEASIBLE_DAY_ROUTE",
+                        "message": "no feasible itinerary for scheduled day",
+                        "dayNumber": day_position + 1,
+                        "date": window.date_value.isoformat(),
+                        "pointIds": [points[index].point.id for index in cluster],
+                        "hotelId": hotels[hotel_index].hotel.id,
+                        "reason": extract_http_detail_message(exc.detail),
+                        "optimizerDetail": exc.detail,
+                    },
+                ) from exc
+
+        routes.append(route)
+        days.append(
+            DayPlan(
+                dayNumber=day_position + 1,
+                date=window.date_value.isoformat(),
+                pointIds=route.point_ids,
+                hotelId=hotels[hotel_index].hotel.id,
+            )
+        )
 
     return SolveResponse(
         tripDays=len(days),
-        solverStatus=s1.solver_status,
-        objective=req.objective,
+        solverStatus="FEASIBLE",
+        objective="min_days_then_transport",
         days=days,
-        diagnostics={
-            "totalTravelMinutes": int(sum(t for _, t in orderings)),
-        },
+        diagnostics=build_solver_diagnostics(req, day_clusters, hotel_per_day, points, hotels, routes),
     )
 
 
-# ═══════════════════════════════════════════════════════════
-# HTTP 入口
-# ═══════════════════════════════════════════════════════════
-
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version}
 
 
 @app.post("/solve", response_model=SolveResponse)
 def solve(req: SolveRequest) -> SolveResponse:
-    lookup = build_lookup(req.distanceMatrix.rows)
-    audit_matrix_completeness(req, lookup)
-    return solve_three_stage(req, lookup)
+    return solve_itinerary(req)
