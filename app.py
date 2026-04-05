@@ -6,10 +6,21 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Literal
 
+import numpy as np
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field as PydField
 
-app = FastAPI(title="Optivoy Optimizer", version="0.8.0")
+try:
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+    ORTOOLS_AVAILABLE = True
+except ImportError:  # pragma: no cover - deployment env should provide ortools
+    pywrapcp = None  # type: ignore[assignment]
+    routing_enums_pb2 = None  # type: ignore[assignment]
+    ORTOOLS_AVAILABLE = False
+
+app = FastAPI(title="Optivoy Optimizer", version="0.9.0")
 
 
 PACE_MODE_WINDOWS: dict[str, tuple[str, str, int]] = {
@@ -197,6 +208,27 @@ class LookupMaps:
     transit_summary: dict[tuple[str, str], str]
 
 
+@dataclass
+class MatrixStore:
+    node_ids: list[str]
+    id_to_idx: dict[str, int]
+    driving: np.ndarray
+    transit: np.ndarray
+    walking_meters: np.ndarray
+    walking_minutes: np.ndarray
+    is_fallback: np.ndarray
+
+
+@dataclass(frozen=True)
+class CityProfile:
+    walk_threshold_meters: int
+    hotel_switch_trigger_min: float
+    hotel_switch_improve_min: float
+    max_points_per_day: int
+    stamina_factor: float
+    day_capacity_buffer: float
+
+
 @dataclass(frozen=True)
 class IterationFeedback:
     hotel_per_day: list[int]
@@ -242,6 +274,107 @@ def fallback_walking_meters(a: Coord, b: Coord) -> int:
     return max(100, int(round(fallback_distance_km(a, b) * 1000)))
 
 
+def build_matrix_store(
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    rows: list[DistanceMatrixRowIn],
+) -> MatrixStore:
+    node_ids: list[str] = []
+    id_to_coord: dict[str, tuple[float, float]] = {}
+
+    for point in points:
+        node_ids.append(point.point.id)
+        id_to_coord[point.point.id] = (
+            point.departure_coord.lat or 0.0,
+            point.departure_coord.lng or 0.0,
+        )
+    for hotel in hotels:
+        node_ids.append(hotel.hotel.id)
+        id_to_coord[hotel.hotel.id] = (
+            hotel.departure_coord.lat or 0.0,
+            hotel.departure_coord.lng or 0.0,
+        )
+
+    node_ids = list(dict.fromkeys(node_ids))
+    id_to_idx = {node_id: index for index, node_id in enumerate(node_ids)}
+    node_count = len(node_ids)
+    is_fallback = np.ones((node_count, node_count), dtype=bool)
+
+    coords = np.array([id_to_coord[node_id] for node_id in node_ids], dtype=np.float64)
+    lats = np.radians(coords[:, 0:1])
+    lngs = np.radians(coords[:, 1:2])
+    dlat = lats - lats.T
+    dlng = lngs - lngs.T
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lats) * np.cos(lats.T) * np.sin(dlng / 2.0) ** 2
+    dist_km = 6371.0 * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(np.maximum(1e-9, 1.0 - a)))
+
+    driving = np.maximum(8, np.rint(dist_km / 25.0 * 60.0 + 8.0).astype(np.int32))
+    transit = np.maximum(10, np.rint(dist_km / 18.0 * 60.0 + 12.0).astype(np.int32))
+    walking_meters = np.maximum(100, np.rint(dist_km * 1000.0).astype(np.int32))
+    walking_minutes = np.maximum(3, np.rint(dist_km / 4.5 * 60.0).astype(np.int32))
+
+    for row in rows:
+        if row.fromPointId not in id_to_idx or row.toPointId not in id_to_idx:
+            continue
+        from_index = id_to_idx[row.fromPointId]
+        to_index = id_to_idx[row.toPointId]
+        driving[from_index, to_index] = row.drivingMinutes
+        transit[from_index, to_index] = row.transitMinutes
+        walking_meters[from_index, to_index] = row.walkingMeters
+        walking_minutes[from_index, to_index] = row.walkingMinutes or max(
+            1,
+            int(round(row.walkingMeters / WALK_SPEED_M_PER_MIN)),
+        )
+        is_fallback[from_index, to_index] = False
+
+    np.fill_diagonal(driving, 0)
+    np.fill_diagonal(transit, 0)
+    np.fill_diagonal(walking_meters, 0)
+    np.fill_diagonal(walking_minutes, 0)
+    np.fill_diagonal(is_fallback, False)
+
+    return MatrixStore(
+        node_ids=node_ids,
+        id_to_idx=id_to_idx,
+        driving=driving,
+        transit=transit,
+        walking_meters=walking_meters,
+        walking_minutes=walking_minutes,
+        is_fallback=is_fallback,
+    )
+
+
+def detect_city_profile(
+    city: str | None,
+    points: list[PointPrepared],
+    matrix: MatrixStore,
+) -> CityProfile:
+    city_name = (city or "").strip()
+    if city_name in CITY_PROFILES:
+        return CITY_PROFILES[city_name]
+    for key in CITY_PROFILES:
+        if key == "default":
+            continue
+        if city_name and (key in city_name or city_name in key):
+            return CITY_PROFILES[key]
+
+    if len(points) < 3:
+        return CITY_PROFILES["default"]
+
+    point_indexes = np.array([matrix.id_to_idx[item.point.id] for item in points], dtype=np.int32)
+    sub_driving = matrix.driving[np.ix_(point_indexes, point_indexes)]
+    mean_driving = float(sub_driving[sub_driving > 0].mean()) if (sub_driving > 0).any() else 30.0
+    sub_walking = matrix.walking_meters[np.ix_(point_indexes, point_indexes)]
+    mean_walking = float(sub_walking[sub_walking > 0].mean()) if (sub_walking > 0).any() else 2000.0
+
+    if mean_driving > 60.0:
+        return CityProfile(1500, 70.0, 35.0, 8, 1.0, 0.85)
+    if mean_walking < 600.0:
+        return CityProfile(600, 25.0, 10.0, 6, 1.1, 0.85)
+    if mean_driving < 20.0:
+        return CityProfile(1200, 30.0, 15.0, 7, 1.0, 0.90)
+    return CITY_PROFILES["default"]
+
 def point_arrival_coord(point: PointIn) -> Coord:
     if point.arrivalAnchor and point.arrivalAnchor.latitude is not None and point.arrivalAnchor.longitude is not None:
         return Coord(point.arrivalAnchor.latitude, point.arrivalAnchor.longitude)
@@ -264,6 +397,21 @@ def hotel_departure_coord(hotel: HotelIn) -> Coord:
     if hotel.departureAnchor and hotel.departureAnchor.latitude is not None and hotel.departureAnchor.longitude is not None:
         return Coord(hotel.departureAnchor.latitude, hotel.departureAnchor.longitude)
     return Coord(hotel.latitude, hotel.longitude)
+
+
+CITY_PROFILES: dict[str, CityProfile] = {
+    "张家界": CityProfile(300, 20.0, 10.0, 4, 1.4, 0.80),
+    "丽江": CityProfile(800, 30.0, 15.0, 6, 1.1, 0.85),
+    "三亚": CityProfile(2000, 40.0, 20.0, 7, 1.0, 0.90),
+    "拉萨": CityProfile(1000, 35.0, 15.0, 5, 1.5, 0.75),
+    "重庆": CityProfile(1000, 45.0, 20.0, 7, 1.2, 0.85),
+    "上海": CityProfile(1200, 45.0, 25.0, 8, 1.0, 0.90),
+    "北京": CityProfile(1500, 60.0, 30.0, 8, 1.0, 0.90),
+    "成都": CityProfile(1500, 40.0, 20.0, 8, 1.0, 0.90),
+    "西安": CityProfile(1200, 35.0, 15.0, 8, 1.0, 0.90),
+    "桂林": CityProfile(1000, 30.0, 15.0, 6, 1.0, 0.85),
+    "default": CityProfile(1500, 60.0, 30.0, 8, 1.0, 0.90),
+}
 
 
 def centroid(coords: list[Coord]) -> Coord:
@@ -492,6 +640,18 @@ def build_day_window(req: SolveRequest, calendar_index: int) -> DayWindow:
     )
 
 
+def point_day_load_v25(point: PointIn, day_value: date, profile: CityProfile) -> int:
+    base = point.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES + queue_minutes_for_day(point, day_value)
+    return int(round(base * profile.stamina_factor))
+
+
+def effective_day_capacity_v25(req: SolveRequest, profile: CityProfile, has_food: bool) -> int:
+    base = PACE_MODE_WINDOWS[req.paceMode][2]
+    if req.mealPolicy == "auto" and not has_food:
+        base -= LUNCH_OVERHEAD_MINUTES
+    return max(120, int(base * profile.day_capacity_buffer))
+
+
 def point_day_load(point: PointIn, day_value: date) -> int:
     return point.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES + queue_minutes_for_day(point, day_value)
 
@@ -510,6 +670,32 @@ def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
             return False
     # Check that the point can actually complete within some opening period on this day
     load = point_day_load(point, window.date_value)
+    periods = weekday_periods(point, window.date_value)
+    if periods:
+        last_entry_min = parse_hhmm(point.lastEntryTime) if point.lastEntryTime else None
+        for period_start, period_end in periods:
+            earliest_start = max(window.start_minutes, period_start)
+            if last_entry_min is not None and earliest_start > last_entry_min:
+                continue
+            if earliest_start + load <= min(period_end, window.end_minutes):
+                return True
+        return False
+    return load <= (window.end_minutes - window.start_minutes)
+
+
+def point_can_be_on_day_v25(point: PointIn, window: DayWindow, profile: CityProfile) -> bool:
+    if window.end_minutes <= window.start_minutes:
+        return False
+    if day_is_closed(point, window.date_value):
+        return False
+    if point.pointType == "spot" and not point.lastEntryTime:
+        return False
+    if point.lastEntryTime:
+        last_entry = parse_hhmm(point.lastEntryTime)
+        if window.start_minutes >= last_entry:
+            return False
+
+    load = point_day_load_v25(point, window.date_value, profile)
     periods = weekday_periods(point, window.date_value)
     if periods:
         last_entry_min = parse_hhmm(point.lastEntryTime) if point.lastEntryTime else None
@@ -666,6 +852,504 @@ def cluster_has_food(cluster: list[int], points: list[PointPrepared]) -> bool:
     if any(points[index].point.hasFoodCourt for index in cluster):
         return True
     return all(points[index].point.suggestedDurationMinutes >= 240 for index in cluster)
+
+
+def find_nearest_hotel_v25(
+    point_indexes: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    matrix: MatrixStore,
+) -> int:
+    if not point_indexes:
+        return 0
+    point_idxes = np.array([matrix.id_to_idx[points[index].point.id] for index in point_indexes], dtype=np.int32)
+    best_hotel = 0
+    best_cost = float("inf")
+    for hotel_index, hotel in enumerate(hotels):
+        hotel_matrix_index = matrix.id_to_idx[hotel.hotel.id]
+        avg_round_trip = float(
+            (matrix.driving[hotel_matrix_index, point_idxes] + matrix.driving[point_idxes, hotel_matrix_index]).mean()
+        )
+        if avg_round_trip < best_cost:
+            best_cost = avg_round_trip
+            best_hotel = hotel_index
+    return best_hotel
+
+
+def matrix_leg_minutes_v25(
+    req: SolveRequest,
+    matrix: MatrixStore,
+    profile: CityProfile,
+    from_id: str,
+    to_id: str,
+) -> int:
+    from_index = matrix.id_to_idx.get(from_id)
+    to_index = matrix.id_to_idx.get(to_id)
+    if from_index is None or to_index is None:
+        return 30
+    walking_distance = int(matrix.walking_meters[from_index, to_index])
+    if 0 < walking_distance <= profile.walk_threshold_meters:
+        return int(matrix.walking_minutes[from_index, to_index])
+    transit_minutes = int(matrix.transit[from_index, to_index])
+    driving_minutes = int(matrix.driving[from_index, to_index])
+    if req.transportPreference == "transit_first":
+        return transit_minutes
+    if req.transportPreference == "driving_first":
+        return driving_minutes
+    return min(transit_minutes, driving_minutes)
+
+
+def compute_edge_weight_v25(
+    from_point: PointPrepared,
+    to_point: PointPrepared,
+    matrix: MatrixStore,
+    profile: CityProfile,
+) -> float:
+    from_index = matrix.id_to_idx[from_point.point.id]
+    to_index = matrix.id_to_idx[to_point.point.id]
+    walking_distance = int(matrix.walking_meters[from_index, to_index])
+    if 0 < walking_distance <= profile.walk_threshold_meters:
+        return float(matrix.walking_minutes[from_index, to_index]) * 0.7
+    return float(matrix.driving[from_index, to_index])
+
+
+def pick_seed_v25(
+    candidates: list[int],
+    points: list[PointPrepared],
+    matrix: MatrixStore,
+    profile: CityProfile,
+) -> int:
+    candidate_indexes = np.array([matrix.id_to_idx[points[index].point.id] for index in candidates], dtype=np.int32)
+    walking_neighbor_counts: dict[int, int] = {}
+    for array_pos, candidate in enumerate(candidates):
+        current_index = candidate_indexes[array_pos]
+        other_indexes = candidate_indexes[candidate_indexes != current_index]
+        if len(other_indexes) == 0:
+            walking_neighbor_counts[candidate] = 0
+            continue
+        distances = matrix.walking_meters[current_index, other_indexes]
+        walking_neighbor_counts[candidate] = int(
+            np.sum((distances > 0) & (distances <= profile.walk_threshold_meters)),
+        )
+
+    max_neighbors = max(walking_neighbor_counts.values())
+    top_candidates = (
+        [candidate for candidate in candidates if walking_neighbor_counts[candidate] == max_neighbors]
+        if max_neighbors > 0
+        else candidates
+    )
+
+    best_candidate = top_candidates[0]
+    best_cost = float("inf")
+    top_indexes = np.array([matrix.id_to_idx[points[index].point.id] for index in top_candidates], dtype=np.int32)
+    for array_pos, candidate in enumerate(top_candidates):
+        current_index = top_indexes[array_pos]
+        other_indexes = top_indexes[top_indexes != current_index]
+        if len(other_indexes) == 0:
+            return candidate
+        walking_minutes = matrix.walking_minutes[current_index, other_indexes].astype(np.float32)
+        walking_distances = matrix.walking_meters[current_index, other_indexes]
+        driving_minutes = matrix.driving[current_index, other_indexes].astype(np.float32)
+        weights = np.where(
+            (walking_distances > 0) & (walking_distances <= profile.walk_threshold_meters),
+            walking_minutes * 0.7,
+            driving_minutes,
+        )
+        total = float(weights.sum())
+        if total < best_cost:
+            best_cost = total
+            best_candidate = candidate
+    return best_candidate
+
+
+def average_weight_to_cluster_v25(
+    candidate_index: int,
+    cluster: list[int],
+    points: list[PointPrepared],
+    matrix: MatrixStore,
+    profile: CityProfile,
+) -> float:
+    if not cluster:
+        return 0.0
+    total = sum(
+        compute_edge_weight_v25(points[cluster_index], points[candidate_index], matrix, profile)
+        for cluster_index in cluster
+    )
+    return total / len(cluster)
+
+
+def estimate_sequence_travel_minutes_v25(
+    sequence: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    hotel_index: int,
+    matrix: MatrixStore,
+    req: SolveRequest,
+    profile: CityProfile,
+    previous_hotel_index: int | None = None,
+) -> int:
+    if not sequence:
+        return 0
+    hotel_id = hotels[hotel_index].hotel.id
+    start_id = hotels[previous_hotel_index].hotel.id if previous_hotel_index is not None else hotel_id
+    route_ids = [start_id]
+    remaining = [points[index].point.id for index in sequence]
+
+    while remaining:
+        best_cost_increase = float("inf")
+        best_insert_position = 1
+        best_candidate_id = remaining[0]
+        for candidate_id in remaining:
+            for insert_position in range(1, len(route_ids) + 1):
+                previous_id = route_ids[insert_position - 1]
+                next_id = route_ids[insert_position] if insert_position < len(route_ids) else hotel_id
+                cost_increase = (
+                    matrix_leg_minutes_v25(req, matrix, profile, previous_id, candidate_id)
+                    + matrix_leg_minutes_v25(req, matrix, profile, candidate_id, next_id)
+                    - matrix_leg_minutes_v25(req, matrix, profile, previous_id, next_id)
+                )
+                if cost_increase < best_cost_increase:
+                    best_cost_increase = cost_increase
+                    best_insert_position = insert_position
+                    best_candidate_id = candidate_id
+        route_ids.insert(best_insert_position, best_candidate_id)
+        remaining.remove(best_candidate_id)
+
+    total = 0
+    for current_id, next_id in zip(route_ids, route_ids[1:]):
+        total += matrix_leg_minutes_v25(req, matrix, profile, current_id, next_id)
+    total += matrix_leg_minutes_v25(req, matrix, profile, route_ids[-1], hotel_id)
+    return total
+
+
+def resolve_hotel_for_day_v25(
+    day_position: int,
+    cluster: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    matrix: MatrixStore,
+    feedback: IterationFeedback | None,
+) -> int:
+    if feedback is not None and day_position < len(feedback.hotel_per_day):
+        return feedback.hotel_per_day[day_position]
+    return find_nearest_hotel_v25(cluster, points, hotels, matrix)
+
+
+def try_swap_for_candidate_v25(
+    candidate_index: int,
+    cluster: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    hotel_index: int,
+    matrix: MatrixStore,
+    req: SolveRequest,
+    profile: CityProfile,
+    window: DayWindow,
+    capacity: int,
+    previous_hotel_index: int | None,
+) -> tuple[list[int], int] | None:
+    original_travel = estimate_sequence_travel_minutes_v25(
+        cluster,
+        points,
+        hotels,
+        hotel_index,
+        matrix,
+        req,
+        profile,
+        previous_hotel_index,
+    )
+    for existing_index in list(cluster):
+        trial_cluster = [index for index in cluster if index != existing_index] + [candidate_index]
+        service_load = sum(
+            point_day_load_v25(points[index].point, window.date_value, profile)
+            for index in trial_cluster
+        )
+        travel_load = estimate_sequence_travel_minutes_v25(
+            trial_cluster,
+            points,
+            hotels,
+            hotel_index,
+            matrix,
+            req,
+            profile,
+            previous_hotel_index,
+        )
+        if service_load + travel_load <= capacity and original_travel - travel_load >= 5:
+            return trial_cluster, existing_index
+    return None
+
+
+def cluster_points_to_days_v25(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    matrix: MatrixStore,
+    profile: CityProfile,
+    feedback: IterationFeedback | None = None,
+) -> list[tuple[DayWindow, list[int]]]:
+    unassigned = list(range(len(points)))
+    day_clusters: list[tuple[DayWindow, list[int]]] = []
+    calendar_index = 0
+    max_calendar_span = max(366, len(points) * 30)
+
+    while unassigned:
+        if calendar_index >= max_calendar_span:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "POINTS_CANNOT_BE_SCHEDULED",
+                    "message": "remaining points cannot be scheduled within a reasonable calendar span",
+                    "remainingPointIds": [points[index].point.id for index in unassigned],
+                },
+            )
+
+        window = build_day_window(req, calendar_index)
+        day_position = len(day_clusters)
+        available = [index for index in unassigned if point_can_be_on_day_v25(points[index].point, window, profile)]
+        if not available:
+            calendar_index += 1
+            continue
+
+        seed = pick_seed_v25(available, points, matrix, profile)
+        cluster = [seed]
+        unassigned.remove(seed)
+        hotel_index = resolve_hotel_for_day_v25(day_position, cluster, points, hotels, matrix, feedback)
+        previous_hotel_index = (
+            feedback.hotel_per_day[day_position - 1]
+            if feedback is not None and day_position > 0 and day_position - 1 < len(feedback.hotel_per_day)
+            else None
+        )
+
+        while True:
+            candidates = [index for index in unassigned if point_can_be_on_day_v25(points[index].point, window, profile)]
+            if not candidates or len(cluster) >= profile.max_points_per_day:
+                break
+            scored_candidates = sorted(
+                candidates,
+                key=lambda candidate: average_weight_to_cluster_v25(candidate, cluster, points, matrix, profile),
+            )
+            added = False
+            for candidate_index in scored_candidates:
+                trial_cluster = cluster + [candidate_index]
+                service_load = sum(
+                    point_day_load_v25(points[index].point, window.date_value, profile)
+                    for index in trial_cluster
+                )
+                travel_load = estimate_sequence_travel_minutes_v25(
+                    trial_cluster,
+                    points,
+                    hotels,
+                    hotel_index,
+                    matrix,
+                    req,
+                    profile,
+                    previous_hotel_index,
+                )
+                capacity = effective_day_capacity_v25(req, profile, cluster_has_food(trial_cluster, points))
+                if service_load + travel_load <= capacity:
+                    cluster.append(candidate_index)
+                    unassigned.remove(candidate_index)
+                    added = True
+                    break
+                swapped = try_swap_for_candidate_v25(
+                    candidate_index,
+                    cluster,
+                    points,
+                    hotels,
+                    hotel_index,
+                    matrix,
+                    req,
+                    profile,
+                    window,
+                    capacity,
+                    previous_hotel_index,
+                )
+                if swapped is not None:
+                    new_cluster, evicted_index = swapped
+                    unassigned.remove(candidate_index)
+                    unassigned.append(evicted_index)
+                    cluster[:] = new_cluster
+                    added = True
+                    break
+            if not added:
+                break
+
+        day_clusters.append((window, cluster))
+        calendar_index += 1
+
+    return day_clusters
+
+
+def assign_hotel_per_day_v25(
+    day_clusters: list[tuple[DayWindow, list[int]]],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    matrix: MatrixStore,
+    req: SolveRequest,
+    profile: CityProfile,
+    feedback: IterationFeedback | None = None,
+) -> list[int]:
+    clusters_only = [cluster for _, cluster in day_clusters]
+    if not clusters_only:
+        return []
+    if req.hotelStrategy == "single":
+        all_indexes = [index for cluster in clusters_only for index in cluster]
+        best_hotel = find_nearest_hotel_v25(all_indexes, points, hotels, matrix)
+        return [best_hotel] * len(clusters_only)
+
+    hotel_count = len(hotels)
+    day_count = len(clusters_only)
+    hotel_day_avg = np.zeros((hotel_count, day_count), dtype=np.float32)
+    hotel_matrix_indexes = np.array([matrix.id_to_idx[item.hotel.id] for item in hotels], dtype=np.int32)
+
+    for day_index, cluster in enumerate(clusters_only):
+        if not cluster:
+            continue
+        point_indexes = np.array([matrix.id_to_idx[points[index].point.id] for index in cluster], dtype=np.int32)
+        hotel_day_avg[:, day_index] = matrix.driving[np.ix_(hotel_matrix_indexes, point_indexes)].mean(axis=1)
+
+    initial_hotel = int(np.argmin(hotel_day_avg.sum(axis=1)))
+    if feedback is not None and feedback.hotel_per_day:
+        initial_hotel = feedback.hotel_per_day[0]
+
+    current_hotel = initial_hotel
+    assignments: list[int] = []
+    for day_index in range(day_count):
+        best_for_day = int(np.argmin(hotel_day_avg[:, day_index]))
+        incumbent = current_hotel
+        if feedback is not None and day_index < len(feedback.hotel_per_day):
+            prior = feedback.hotel_per_day[day_index]
+            if hotel_day_avg[prior, day_index] < hotel_day_avg[current_hotel, day_index]:
+                incumbent = prior
+        current_avg = float(hotel_day_avg[incumbent, day_index])
+        best_avg = float(hotel_day_avg[best_for_day, day_index])
+        if (
+            current_avg > profile.hotel_switch_trigger_min
+            and best_avg + profile.hotel_switch_improve_min < current_avg
+        ):
+            incumbent = best_for_day
+        current_hotel = incumbent
+        assignments.append(current_hotel)
+    return assignments
+
+
+def local_search_improvement_v25(
+    day_clusters: list[tuple[DayWindow, list[int]]],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    hotel_per_day: list[int],
+    matrix: MatrixStore,
+    req: SolveRequest,
+    profile: CityProfile,
+    max_iterations: int = 50,
+) -> tuple[list[tuple[DayWindow, list[int]]], list[int]]:
+    best_clusters = [list(cluster) for _, cluster in day_clusters]
+    best_hotels = list(hotel_per_day)
+    windows = [window for window, _ in day_clusters]
+
+    def day_cost(cluster: list[int], hotel_index: int, window: DayWindow, previous_hotel_index: int | None) -> int:
+        return estimate_sequence_travel_minutes_v25(
+            cluster,
+            points,
+            hotels,
+            hotel_index,
+            matrix,
+            req,
+            profile,
+            previous_hotel_index,
+        )
+
+    def check_capacity(cluster: list[int], window: DayWindow, hotel_index: int, previous_hotel_index: int | None) -> bool:
+        if len(cluster) > profile.max_points_per_day:
+            return False
+        service = sum(point_day_load_v25(points[index].point, window.date_value, profile) for index in cluster)
+        travel = day_cost(cluster, hotel_index, window, previous_hotel_index)
+        capacity = effective_day_capacity_v25(req, profile, cluster_has_food(cluster, points))
+        return service + travel <= capacity
+
+    improved = True
+    iterations = 0
+    while improved and iterations < max_iterations:
+        improved = False
+        iterations += 1
+        day_count = len(best_clusters)
+
+        for source_day in range(day_count):
+            for point_index in list(best_clusters[source_day]):
+                point = points[point_index]
+                for target_day in range(day_count):
+                    if source_day == target_day:
+                        continue
+                    if not point_can_be_on_day_v25(point.point, windows[target_day], profile):
+                        continue
+                    new_source_cluster = [index for index in best_clusters[source_day] if index != point_index]
+                    new_target_cluster = best_clusters[target_day] + [point_index]
+                    previous_target_hotel = best_hotels[target_day - 1] if target_day > 0 else None
+                    if not check_capacity(new_target_cluster, windows[target_day], best_hotels[target_day], previous_target_hotel):
+                        continue
+                    old_cost = (
+                        day_cost(best_clusters[source_day], best_hotels[source_day], windows[source_day], best_hotels[source_day - 1] if source_day > 0 else None)
+                        + day_cost(best_clusters[target_day], best_hotels[target_day], windows[target_day], previous_target_hotel)
+                    )
+                    new_source_hotel = (
+                        find_nearest_hotel_v25(new_source_cluster, points, hotels, matrix)
+                        if new_source_cluster
+                        else best_hotels[source_day]
+                    )
+                    new_cost = (
+                        day_cost(new_source_cluster, new_source_hotel, windows[source_day], best_hotels[source_day - 1] if source_day > 0 else None)
+                        + day_cost(new_target_cluster, best_hotels[target_day], windows[target_day], previous_target_hotel)
+                    )
+                    if new_cost < old_cost - 5:
+                        best_clusters[source_day] = new_source_cluster
+                        best_clusters[target_day] = new_target_cluster
+                        best_hotels[source_day] = new_source_hotel
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if improved:
+            continue
+
+        for first_day in range(day_count):
+            for second_day in range(first_day + 1, day_count):
+                previous_first_hotel = best_hotels[first_day - 1] if first_day > 0 else None
+                previous_second_hotel = best_hotels[second_day - 1] if second_day > 0 else None
+                for first_point in list(best_clusters[first_day]):
+                    for second_point in list(best_clusters[second_day]):
+                        if not point_can_be_on_day_v25(points[first_point].point, windows[second_day], profile):
+                            continue
+                        if not point_can_be_on_day_v25(points[second_point].point, windows[first_day], profile):
+                            continue
+                        new_first_cluster = [index for index in best_clusters[first_day] if index != first_point] + [second_point]
+                        new_second_cluster = [index for index in best_clusters[second_day] if index != second_point] + [first_point]
+                        if not check_capacity(new_first_cluster, windows[first_day], best_hotels[first_day], previous_first_hotel):
+                            continue
+                        if not check_capacity(new_second_cluster, windows[second_day], best_hotels[second_day], previous_second_hotel):
+                            continue
+                        old_cost = (
+                            day_cost(best_clusters[first_day], best_hotels[first_day], windows[first_day], previous_first_hotel)
+                            + day_cost(best_clusters[second_day], best_hotels[second_day], windows[second_day], previous_second_hotel)
+                        )
+                        new_cost = (
+                            day_cost(new_first_cluster, best_hotels[first_day], windows[first_day], previous_first_hotel)
+                            + day_cost(new_second_cluster, best_hotels[second_day], windows[second_day], previous_second_hotel)
+                        )
+                        if new_cost < old_cost - 5:
+                            best_clusters[first_day] = new_first_cluster
+                            best_clusters[second_day] = new_second_cluster
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+
+    return [(windows[index], best_clusters[index]) for index in range(len(best_clusters))], best_hotels
 
 
 def cluster_weight(
@@ -1172,6 +1856,244 @@ def solve_day_route(
     return best
 
 
+def verify_and_build_route_v25(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    day_window: DayWindow,
+    hotel_index: int,
+    cluster: list[int],
+    ordered_ids: list[str],
+    lookups: LookupMaps,
+    previous_hotel_index: int | None,
+    is_last_day: bool,
+) -> EvaluatedRoute:
+    id_to_cluster_pos = {points[index].point.id: pos for pos, index in enumerate(cluster)}
+    ordering = [id_to_cluster_pos[point_id] for point_id in ordered_ids if point_id in id_to_cluster_pos]
+    start_anchor = build_start_anchor(hotels, hotel_index, previous_hotel_index)
+    return evaluate_order(
+        req,
+        points,
+        hotels,
+        day_window,
+        hotel_index,
+        cluster,
+        ordering,
+        lookups,
+        start_anchor,
+        previous_hotel_index,
+        is_last_day,
+    )
+
+
+def rank_hotel_candidates_v25(
+    cluster: list[int],
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    matrix: MatrixStore,
+    preferred_hotel_index: int,
+    previous_hotel_index: int | None,
+    limit: int = 12,
+) -> list[int]:
+    if not cluster:
+        return [preferred_hotel_index]
+    point_indexes = np.array([matrix.id_to_idx[points[index].point.id] for index in cluster], dtype=np.int32)
+    scores: list[tuple[float, int]] = []
+    for hotel_index, hotel in enumerate(hotels):
+        hotel_matrix_index = matrix.id_to_idx[hotel.hotel.id]
+        avg_round_trip = float(
+            (matrix.driving[hotel_matrix_index, point_indexes] + matrix.driving[point_indexes, hotel_matrix_index]).mean()
+        )
+        scores.append((avg_round_trip, hotel_index))
+    scores.sort(key=lambda item: item[0])
+    ranked = [hotel_index for _, hotel_index in scores[: max(1, min(limit, len(scores)))]]
+    for special in (preferred_hotel_index, previous_hotel_index):
+        if special is not None and special not in ranked:
+            ranked.append(special)
+    return ranked
+
+
+def build_routing_order_for_hotel_v25(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    cluster: list[int],
+    hotel_index: int,
+    lookups: LookupMaps,
+    previous_hotel_index: int | None,
+) -> list[str] | None:
+    if not ORTOOLS_AVAILABLE or not cluster:
+        return None
+
+    start_hotel = hotels[previous_hotel_index] if previous_hotel_index is not None else hotels[hotel_index]
+    end_hotel = hotels[hotel_index]
+
+    node_ids = [start_hotel.hotel.id] + [points[index].point.id for index in cluster] + [end_hotel.hotel.id]
+    node_departures = [start_hotel.departure_coord] + [points[index].departure_coord for index in cluster] + [end_hotel.departure_coord]
+    node_arrivals = [start_hotel.arrival_coord] + [points[index].arrival_coord for index in cluster] + [end_hotel.arrival_coord]
+
+    node_count = len(node_ids)
+    travel_matrix: list[list[int]] = [[0] * node_count for _ in range(node_count)]
+    for from_index in range(node_count):
+        for to_index in range(node_count):
+            if from_index == to_index:
+                continue
+            if to_index == 0 or from_index == node_count - 1:
+                travel_matrix[from_index][to_index] = 10**6
+                continue
+            choice = lookup_travel_choice(
+                node_ids[from_index],
+                node_departures[from_index],
+                node_ids[to_index],
+                node_arrivals[to_index],
+                req,
+                lookups,
+            )
+            travel_matrix[from_index][to_index] = choice.minutes
+
+    manager = pywrapcp.RoutingIndexManager(node_count, 1, [0], [node_count - 1])
+    routing = pywrapcp.RoutingModel(manager)
+
+    def transit_callback(from_index: int, to_index: int) -> int:
+        return travel_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
+    transit_callback_index = routing.RegisterTransitCallback(transit_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_parameters.time_limit.FromMilliseconds(50)
+    search_parameters.log_search = False
+
+    solution = routing.SolveWithParameters(search_parameters)
+    if solution is None:
+        return None
+
+    index = routing.Start(0)
+    ordered_point_ids: list[str] = []
+    while not routing.IsEnd(index):
+        node = manager.IndexToNode(index)
+        if 0 < node < node_count - 1:
+            ordered_point_ids.append(node_ids[node])
+        index = solution.Value(routing.NextVar(index))
+    return ordered_point_ids
+
+
+def solve_day_with_ortools_v25(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    day_window: DayWindow,
+    cluster: list[int],
+    matrix: MatrixStore,
+    lookups: LookupMaps,
+    preferred_hotel_index: int,
+    previous_hotel_index: int | None,
+    is_last_day: bool,
+) -> tuple[int, EvaluatedRoute]:
+    if not cluster:
+        route = verify_and_build_route_v25(
+            req,
+            points,
+            hotels,
+            day_window,
+            preferred_hotel_index,
+            cluster,
+            [],
+            lookups,
+            previous_hotel_index,
+            is_last_day,
+        )
+        return preferred_hotel_index, route
+
+    candidate_hotels = (
+        [preferred_hotel_index]
+        if req.hotelStrategy == "single"
+        else rank_hotel_candidates_v25(
+            cluster,
+            points,
+            hotels,
+            matrix,
+            preferred_hotel_index,
+            previous_hotel_index,
+        )
+    )
+
+    best_route: EvaluatedRoute | None = None
+    best_hotel_index: int | None = None
+    failures: list[str] = []
+
+    for hotel_index in candidate_hotels:
+        ordered_ids = build_routing_order_for_hotel_v25(
+            req,
+            points,
+            hotels,
+            cluster,
+            hotel_index,
+            lookups,
+            previous_hotel_index,
+        )
+        if ordered_ids is None:
+            continue
+        try:
+            route = verify_and_build_route_v25(
+                req,
+                points,
+                hotels,
+                day_window,
+                hotel_index,
+                cluster,
+                ordered_ids,
+                lookups,
+                previous_hotel_index,
+                is_last_day,
+            )
+        except HTTPException as exc:
+            failures.append(extract_http_detail_message(exc.detail))
+            continue
+        if best_route is None or route.effective_cost < best_route.effective_cost:
+            best_route = route
+            best_hotel_index = hotel_index
+
+    if best_route is not None and best_hotel_index is not None:
+        return best_hotel_index, best_route
+
+    fallback_candidates = candidate_hotels or [preferred_hotel_index]
+    for hotel_index in fallback_candidates:
+        try:
+            route = solve_day_route(
+                req,
+                points,
+                hotels,
+                day_window,
+                hotel_index,
+                cluster,
+                build_start_anchor(hotels, hotel_index, previous_hotel_index),
+                previous_hotel_index,
+                is_last_day,
+                lookups,
+            )
+        except HTTPException as exc:
+            failures.append(extract_http_detail_message(exc.detail))
+            continue
+        if best_route is None or route.effective_cost < best_route.effective_cost:
+            best_route = route
+            best_hotel_index = hotel_index
+
+    if best_route is None or best_hotel_index is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NO_FEASIBLE_DAY_ROUTE",
+                "message": "no feasible itinerary for scheduled day",
+                "date": day_window.date_value.isoformat(),
+                "pointIds": [points[index].point.id for index in cluster],
+                "reasonSummary": failures[:5],
+            },
+        )
+    return best_hotel_index, best_route
+
+
 def build_start_anchor(
     hotels: list[HotelPrepared],
     hotel_index: int,
@@ -1211,7 +2133,7 @@ def build_solver_diagnostics(
             {
                 "dayNumber": index + 1,
                 "date": window.date_value.isoformat(),
-                "pointIds": [points[point_index].point.id for point_index in cluster],
+                "pointIds": route.point_ids,
                 "hotelId": hotels[hotel_indexes[index]].hotel.id,
                 "travelMinutes": route.diagnostics.travel_minutes,
                 "queueMinutes": route.diagnostics.queue_minutes,
@@ -1225,6 +2147,65 @@ def build_solver_diagnostics(
             for index, ((window, cluster), route) in enumerate(zip(day_clusters, day_routes))
         ],
     }
+
+
+def solution_score_v25(
+    routes: list[EvaluatedRoute],
+    points: list[PointPrepared],
+    day_count: int,
+    profile: CityProfile,
+) -> float:
+    total_travel = sum(route.diagnostics.travel_minutes for route in routes)
+    hotel_switches = sum(1 for route in routes if route.diagnostics.hotel_switch)
+    point_duration_by_id = {item.point.id: item.point.suggestedDurationMinutes for item in points}
+    single_point_penalty = 0.0
+    for route in routes:
+        if len(route.point_ids) == 1:
+            if point_duration_by_id.get(route.point_ids[0], 0) < 360:
+                single_point_penalty += 120.0
+    return total_travel + hotel_switches * profile.hotel_switch_improve_min + single_point_penalty + day_count * 10.0
+
+
+def validate_solution_universally_v25(
+    result: SolveResponse,
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    lookups: LookupMaps,
+) -> list[str]:
+    warnings: list[str] = []
+    point_index_by_id = {item.point.id: index for index, item in enumerate(points)}
+    hotel_index_by_id = {item.hotel.id: index for index, item in enumerate(hotels)}
+    previous_hotel_index: int | None = None
+
+    for day in result.days:
+        window = build_day_window(req, day.dayNumber - 1)
+        cluster = [point_index_by_id[point_id] for point_id in day.pointIds if point_id in point_index_by_id]
+        hotel_index = hotel_index_by_id.get(day.hotelId)
+        if hotel_index is None:
+            warnings.append(f"day {day.dayNumber}: unknown hotel {day.hotelId}")
+            continue
+        ordering_map = {points[index].point.id: pos for pos, index in enumerate(cluster)}
+        ordering = [ordering_map[point_id] for point_id in day.pointIds if point_id in ordering_map]
+        start_anchor = build_start_anchor(hotels, hotel_index, previous_hotel_index)
+        try:
+            evaluate_order(
+                req,
+                points,
+                hotels,
+                window,
+                hotel_index,
+                cluster,
+                ordering,
+                lookups,
+                start_anchor,
+                previous_hotel_index,
+                day.dayNumber == result.tripDays,
+            )
+        except HTTPException as exc:
+            warnings.append(f"day {day.dayNumber}: {extract_http_detail_message(exc.detail)}")
+        previous_hotel_index = hotel_index
+    return warnings
 
 
 def build_iteration_feedback(
@@ -1327,6 +2308,8 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
     points = prepare_points(req)
     hotels = filter_hotels(req)
     lookups = build_lookup_maps(req.distanceMatrix.rows)
+    matrix = build_matrix_store(points, hotels, req.distanceMatrix.rows)
+    profile = detect_city_profile(req.city, points, matrix)
     feedback: IterationFeedback | None = None
     best_day_clusters: list[tuple[DayWindow, list[int]]] | None = None
     best_hotel_per_day: list[int] | None = None
@@ -1334,20 +2317,66 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
     best_score: float | None = None
 
     for _ in range(OPTIMIZATION_ROUNDS):
-        day_clusters, hotel_per_day, routes = execute_planning_round(
+        day_clusters = cluster_points_to_days_v25(
             req,
             points,
             hotels,
-            lookups,
+            matrix,
+            profile,
             feedback,
         )
-        score = solution_round_score(routes)
+        hotel_per_day = assign_hotel_per_day_v25(
+            day_clusters,
+            points,
+            hotels,
+            matrix,
+            req,
+            profile,
+            feedback,
+        )
+        day_clusters, hotel_per_day = local_search_improvement_v25(
+            day_clusters,
+            points,
+            hotels,
+            hotel_per_day,
+            matrix,
+            req,
+            profile,
+        )
+
+        routes: list[EvaluatedRoute] = []
+        final_hotel_per_day: list[int] = []
+        for day_position, (window, cluster) in enumerate(day_clusters):
+            previous_hotel_index = final_hotel_per_day[day_position - 1] if day_position > 0 else None
+            is_last_day = day_position == len(day_clusters) - 1
+            preferred_hotel_index = hotel_per_day[day_position]
+            hotel_index, route = solve_day_with_ortools_v25(
+                req,
+                points,
+                hotels,
+                window,
+                cluster,
+                matrix,
+                lookups,
+                preferred_hotel_index,
+                previous_hotel_index,
+                is_last_day,
+            )
+            routes.append(route)
+            final_hotel_per_day.append(hotel_index)
+
+        score = solution_score_v25(
+            routes,
+            points,
+            len(day_clusters),
+            profile,
+        )
         if best_score is None or score < best_score:
             best_score = score
             best_day_clusters = day_clusters
-            best_hotel_per_day = hotel_per_day
+            best_hotel_per_day = final_hotel_per_day
             best_routes = routes
-        feedback = build_iteration_feedback(day_clusters, hotel_per_day, routes)
+        feedback = build_iteration_feedback(day_clusters, final_hotel_per_day, routes)
 
     if best_day_clusters is None or best_hotel_per_day is None or best_routes is None:
         raise HTTPException(status_code=500, detail="optimizer failed to produce itinerary")
@@ -1364,10 +2393,10 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
             )
         )
 
-    return SolveResponse(
+    result = SolveResponse(
         tripDays=len(days),
         solverStatus="FEASIBLE",
-        objective="min_days_then_transport",
+        objective="min_travel_then_hotel_switches",
         days=days,
         diagnostics=build_solver_diagnostics(
             req,
@@ -1378,6 +2407,19 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
             best_routes,
         ),
     )
+    if result.diagnostics is not None:
+        result.diagnostics["cityProfile"] = {
+            "walkThresholdMeters": profile.walk_threshold_meters,
+            "hotelSwitchTriggerMin": profile.hotel_switch_trigger_min,
+            "hotelSwitchImproveMin": profile.hotel_switch_improve_min,
+            "maxPointsPerDay": profile.max_points_per_day,
+            "staminaFactor": profile.stamina_factor,
+            "dayCapacityBuffer": profile.day_capacity_buffer,
+        }
+        warnings = validate_solution_universally_v25(result, req, points, hotels, lookups)
+        if warnings:
+            result.diagnostics["validationWarnings"] = warnings
+    return result
 
 
 @app.get("/health")
