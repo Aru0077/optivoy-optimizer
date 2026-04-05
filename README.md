@@ -46,6 +46,7 @@ curl -X POST http://127.0.0.1:8088/solve \
 
 - `pointType`
 - `suggestedDurationMinutes`
+- `staminaFactor`（景点级体力系数，默认 `1.0`）
 - `latitude` / `longitude`
 - `arrivalAnchor` / `departureAnchor`
 - `openingHoursJson`
@@ -104,7 +105,8 @@ curl -X POST http://127.0.0.1:8088/solve \
 
 - 优先用 OR-Tools Routing 求候选顺序
 - 再用原有严格时间窗链路验真
-- 若 OR-Tools 候选不可行，则降级到精确枚举 `solve_day_route`
+- 对 `<= 8` 点日程，继续执行精确枚举 `solve_day_route` 兜底，避免只拿到“可行但不优”的顺序
+- OR-Tools 求解时间已放宽到 `500ms`
 
 ### Phase 3：反馈收敛
 

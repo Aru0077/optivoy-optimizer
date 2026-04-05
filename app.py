@@ -67,6 +67,7 @@ class PointIn(BaseModel):
     id: str = PydField(min_length=1, max_length=64)
     pointType: Literal["spot", "shopping"]
     suggestedDurationMinutes: int = PydField(ge=10, le=720)
+    staminaFactor: float = PydField(default=1.0, ge=0.5, le=3.0)
     latitude: float | None = None
     longitude: float | None = None
     arrivalAnchor: CoordinateIn | None = None
@@ -641,8 +642,12 @@ def build_day_window(req: SolveRequest, calendar_index: int) -> DayWindow:
 
 
 def point_day_load_v25(point: PointIn, day_value: date, profile: CityProfile) -> int:
-    base = point.suggestedDurationMinutes + PER_POINT_OVERHEAD_MINUTES + queue_minutes_for_day(point, day_value)
-    return int(round(base * profile.stamina_factor))
+    return point_visit_minutes_v25(point, profile) + PER_POINT_OVERHEAD_MINUTES + queue_minutes_for_day(point, day_value)
+
+
+def point_visit_minutes_v25(point: PointIn, profile: CityProfile) -> int:
+    spot_factor = point.staminaFactor if point.pointType == "spot" else 1.0
+    return max(10, int(round(point.suggestedDurationMinutes * profile.stamina_factor * spot_factor)))
 
 
 def effective_day_capacity_v25(req: SolveRequest, profile: CityProfile, has_food: bool) -> int:
@@ -1691,6 +1696,7 @@ def evaluate_order(
     req: SolveRequest,
     points: list[PointPrepared],
     hotels: list[HotelPrepared],
+    profile: CityProfile,
     day_window: DayWindow,
     hotel_index: int,
     day_point_indexes: list[int],
@@ -1755,7 +1761,7 @@ def evaluate_order(
 
         queue_minutes = queue_minutes_for_day(point, day_window.date_value)
         queue_total += queue_minutes
-        service_end = current_time + point.suggestedDurationMinutes + queue_minutes
+        service_end = current_time + point_visit_minutes_v25(point, profile) + queue_minutes
         if service_end > service_window_end or service_end > day_end_limit:
             raise HTTPException(status_code=400, detail=f"point {point.id} exceeds open window")
 
@@ -1805,6 +1811,7 @@ def solve_day_route(
     req: SolveRequest,
     points: list[PointPrepared],
     hotels: list[HotelPrepared],
+    profile: CityProfile,
     day_window: DayWindow,
     hotel_index: int,
     day_point_indexes: list[int],
@@ -1818,6 +1825,7 @@ def solve_day_route(
             req,
             points,
             hotels,
+            profile,
             day_window,
             hotel_index,
             day_point_indexes,
@@ -1837,6 +1845,7 @@ def solve_day_route(
                 req,
                 points,
                 hotels,
+                profile,
                 day_window,
                 hotel_index,
                 day_point_indexes,
@@ -1860,6 +1869,7 @@ def verify_and_build_route_v25(
     req: SolveRequest,
     points: list[PointPrepared],
     hotels: list[HotelPrepared],
+    profile: CityProfile,
     day_window: DayWindow,
     hotel_index: int,
     cluster: list[int],
@@ -1875,6 +1885,7 @@ def verify_and_build_route_v25(
         req,
         points,
         hotels,
+        profile,
         day_window,
         hotel_index,
         cluster,
@@ -1962,7 +1973,7 @@ def build_routing_order_for_hotel_v25(
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.FromMilliseconds(50)
+    search_parameters.time_limit.FromMilliseconds(500)
     search_parameters.log_search = False
 
     solution = routing.SolveWithParameters(search_parameters)
@@ -1983,6 +1994,7 @@ def solve_day_with_ortools_v25(
     req: SolveRequest,
     points: list[PointPrepared],
     hotels: list[HotelPrepared],
+    profile: CityProfile,
     day_window: DayWindow,
     cluster: list[int],
     matrix: MatrixStore,
@@ -1996,6 +2008,7 @@ def solve_day_with_ortools_v25(
             req,
             points,
             hotels,
+            profile,
             day_window,
             preferred_hotel_index,
             cluster,
@@ -2040,6 +2053,7 @@ def solve_day_with_ortools_v25(
                 req,
                 points,
                 hotels,
+                profile,
                 day_window,
                 hotel_index,
                 cluster,
@@ -2047,6 +2061,29 @@ def solve_day_with_ortools_v25(
                 lookups,
                 previous_hotel_index,
                 is_last_day,
+            )
+        except HTTPException as exc:
+            failures.append(extract_http_detail_message(exc.detail))
+            continue
+        if best_route is None or route.effective_cost < best_route.effective_cost:
+            best_route = route
+            best_hotel_index = hotel_index
+
+    exact_candidates = candidate_hotels if len(cluster) <= MAX_EXACT_PERMUTATION_SIZE else []
+    for hotel_index in exact_candidates:
+        try:
+            route = solve_day_route(
+                req,
+                points,
+                hotels,
+                profile,
+                day_window,
+                hotel_index,
+                cluster,
+                build_start_anchor(hotels, hotel_index, previous_hotel_index),
+                previous_hotel_index,
+                is_last_day,
+                lookups,
             )
         except HTTPException as exc:
             failures.append(extract_http_detail_message(exc.detail))
@@ -2065,6 +2102,7 @@ def solve_day_with_ortools_v25(
                 req,
                 points,
                 hotels,
+                profile,
                 day_window,
                 hotel_index,
                 cluster,
@@ -2157,7 +2195,7 @@ def solution_score_v25(
 ) -> float:
     total_travel = sum(route.diagnostics.travel_minutes for route in routes)
     hotel_switches = sum(1 for route in routes if route.diagnostics.hotel_switch)
-    point_duration_by_id = {item.point.id: item.point.suggestedDurationMinutes for item in points}
+    point_duration_by_id = {item.point.id: point_visit_minutes_v25(item.point, profile) for item in points}
     single_point_penalty = 0.0
     for route in routes:
         if len(route.point_ids) == 1:
@@ -2172,6 +2210,7 @@ def validate_solution_universally_v25(
     points: list[PointPrepared],
     hotels: list[HotelPrepared],
     lookups: LookupMaps,
+    profile: CityProfile,
 ) -> list[str]:
     warnings: list[str] = []
     point_index_by_id = {item.point.id: index for index, item in enumerate(points)}
@@ -2193,6 +2232,7 @@ def validate_solution_universally_v25(
                 req,
                 points,
                 hotels,
+                profile,
                 window,
                 hotel_index,
                 cluster,
@@ -2243,6 +2283,7 @@ def execute_planning_round(
     lookups: LookupMaps,
     feedback: IterationFeedback | None,
 ) -> tuple[list[tuple[DayWindow, list[int]]], list[int], list[EvaluatedRoute]]:
+    profile = CITY_PROFILES["default"]
     day_clusters = cluster_points_to_days(req, points, hotels, lookups, feedback)
     hotel_per_day = assign_hotel_per_day(day_clusters, points, hotels, lookups, req, feedback)
     routes: list[EvaluatedRoute] = []
@@ -2258,6 +2299,7 @@ def execute_planning_round(
                 req,
                 points,
                 hotels,
+                profile,
                 window,
                 hotel_index,
                 cluster,
@@ -2275,6 +2317,7 @@ def execute_planning_round(
                     req_no_meal,
                     points,
                     hotels,
+                    profile,
                     window,
                     hotel_index,
                     cluster,
@@ -2354,6 +2397,7 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
                 req,
                 points,
                 hotels,
+                profile,
                 window,
                 cluster,
                 matrix,
@@ -2416,7 +2460,7 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
             "staminaFactor": profile.stamina_factor,
             "dayCapacityBuffer": profile.day_capacity_buffer,
         }
-        warnings = validate_solution_universally_v25(result, req, points, hotels, lookups)
+        warnings = validate_solution_universally_v25(result, req, points, hotels, lookups, profile)
         if warnings:
             result.diagnostics["validationWarnings"] = warnings
     return result
