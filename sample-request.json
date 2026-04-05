@@ -6,7 +6,6 @@
   "hotelStrategy": "smart",
   "mealPolicy": "auto",
   "transportPreference": "mixed",
-  "maxDays": 8,
   "maxIntradayDrivingMinutes": 120,
   "points": [
     {

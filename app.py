@@ -22,11 +22,13 @@ WALK_THRESHOLD_METERS = 1500
 WALK_SPEED_M_PER_MIN = 83
 MAX_EXACT_PERMUTATION_SIZE = 8
 MAX_POINTS_PER_DAY = 8
-TRAVEL_OVERHEAD_PER_POINT = 30
 LUNCH_OVERHEAD_MINUTES = 45
 LUNCH_INSERT_AFTER_MINUTES = 11 * 60 + 30
 PER_POINT_OVERHEAD_MINUTES = 12
 GEO_ZIGZAG_PENALTY = 8.0
+HOTEL_SWITCH_TRIGGER_MINUTES = 60.0
+HOTEL_SWITCH_IMPROVEMENT_MINUTES = 30.0
+OPTIMIZATION_ROUNDS = 2
 
 
 class CoordinateIn(BaseModel):
@@ -193,6 +195,13 @@ class LookupMaps:
     walking_minutes: dict[tuple[str, str], int]
     distance_km: dict[tuple[str, str], float]
     transit_summary: dict[tuple[str, str], str]
+
+
+@dataclass(frozen=True)
+class IterationFeedback:
+    hotel_per_day: list[int]
+    point_day_by_index: dict[int, int]
+    point_order_by_index: dict[int, int]
 
 
 def parse_hhmm(value: str) -> int:
@@ -514,12 +523,143 @@ def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
     return load <= (window.end_minutes - window.start_minutes)
 
 
-def effective_day_capacity(req: SolveRequest, n_points: int, has_food: bool) -> int:
+def effective_day_capacity(req: SolveRequest, has_food: bool) -> int:
     base = PACE_MODE_WINDOWS[req.paceMode][2]
     if req.mealPolicy == "auto" and not has_food:
         base -= LUNCH_OVERHEAD_MINUTES
-    base -= (n_points + 1) * TRAVEL_OVERHEAD_PER_POINT
     return max(120, base)
+
+
+def cluster_service_load(cluster: list[int], points: list[PointPrepared], day_value: date) -> int:
+    return sum(point_day_load(points[index].point, day_value) for index in cluster)
+
+
+def route_leg_minutes(
+    req: SolveRequest,
+    lookups: LookupMaps,
+    from_id: str | None,
+    from_coord: Coord,
+    to_id: str | None,
+    to_coord: Coord,
+) -> int:
+    return lookup_travel_choice(from_id, from_coord, to_id, to_coord, req, lookups).minutes
+
+
+def estimate_route_travel_for_sequence(
+    req: SolveRequest,
+    sequence: list[int],
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+    start_anchor: Anchor | None,
+    end_anchor: Anchor | None,
+) -> int:
+    total = 0
+
+    if start_anchor and sequence:
+        first_point = points[sequence[0]]
+        total += route_leg_minutes(
+            req,
+            lookups,
+            start_anchor.node_id,
+            start_anchor.departure,
+            first_point.point.id,
+            first_point.arrival_coord,
+        )
+
+    for current_index, next_index in zip(sequence, sequence[1:]):
+        current_point = points[current_index]
+        next_point = points[next_index]
+        total += route_leg_minutes(
+            req,
+            lookups,
+            current_point.point.id,
+            current_point.departure_coord,
+            next_point.point.id,
+            next_point.arrival_coord,
+        )
+
+    if end_anchor and sequence:
+        last_point = points[sequence[-1]]
+        total += route_leg_minutes(
+            req,
+            lookups,
+            last_point.point.id,
+            last_point.departure_coord,
+            end_anchor.node_id,
+            end_anchor.arrival,
+        )
+
+    return total
+
+
+def choose_seed_for_estimate(
+    req: SolveRequest,
+    point_indexes: list[int],
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+    start_anchor: Anchor | None,
+    end_anchor: Anchor | None,
+) -> int:
+    if len(point_indexes) == 1:
+        return point_indexes[0]
+
+    best_index = point_indexes[0]
+    best_cost = float("inf")
+    for point_index in point_indexes:
+        cost = estimate_route_travel_for_sequence(
+            req,
+            [point_index],
+            points,
+            lookups,
+            start_anchor,
+            end_anchor,
+        )
+        if cost < best_cost:
+            best_cost = cost
+            best_index = point_index
+    return best_index
+
+
+def estimate_cluster_route_minutes(
+    req: SolveRequest,
+    cluster: list[int],
+    points: list[PointPrepared],
+    lookups: LookupMaps,
+    start_anchor: Anchor | None,
+    end_anchor: Anchor | None,
+) -> int:
+    if not cluster:
+        return 0
+
+    seed = choose_seed_for_estimate(req, cluster, points, lookups, start_anchor, end_anchor)
+    ordering = [seed]
+    remaining = [index for index in cluster if index != seed]
+
+    while remaining:
+        best_candidate = remaining[0]
+        best_ordering: list[int] | None = None
+        best_cost = float("inf")
+
+        for candidate in remaining:
+            for insert_position in range(len(ordering) + 1):
+                candidate_ordering = ordering[:insert_position] + [candidate] + ordering[insert_position:]
+                candidate_cost = estimate_route_travel_for_sequence(
+                    req,
+                    candidate_ordering,
+                    points,
+                    lookups,
+                    start_anchor,
+                    end_anchor,
+                )
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_candidate = candidate
+                    best_ordering = candidate_ordering
+
+        ordering = best_ordering if best_ordering is not None else ordering + [best_candidate]
+        remaining.remove(best_candidate)
+
+    return estimate_route_travel_for_sequence(req, ordering, points, lookups, start_anchor, end_anchor)
 
 
 def cluster_has_food(cluster: list[int], points: list[PointPrepared]) -> bool:
@@ -571,6 +711,24 @@ def pick_seed(candidates: list[int], points: list[PointPrepared], lookups: Looku
     return best_index
 
 
+def prioritize_candidates_for_day(
+    candidates: list[int],
+    day_position: int,
+    feedback: IterationFeedback | None,
+) -> list[int]:
+    if feedback is None:
+        return candidates
+
+    same_day = [index for index in candidates if feedback.point_day_by_index.get(index) == day_position]
+    if not same_day:
+        return candidates
+
+    return sorted(
+        same_day,
+        key=lambda index: feedback.point_order_by_index.get(index, 10**9),
+    )
+
+
 def pick_nearest_to_cluster(
     candidates: list[int],
     cluster: list[int],
@@ -593,7 +751,9 @@ def pick_nearest_to_cluster(
 def cluster_points_to_days(
     req: SolveRequest,
     points: list[PointPrepared],
+    hotels: list[HotelPrepared],
     lookups: LookupMaps,
+    feedback: IterationFeedback | None = None,
 ) -> list[tuple[DayWindow, list[int]]]:
     unassigned = list(range(len(points)))
     day_clusters: list[tuple[DayWindow, list[int]]] = []
@@ -612,31 +772,90 @@ def cluster_points_to_days(
             )
 
         window = build_day_window(req, calendar_index)
-        available_today = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
+        day_position = len(day_clusters)
+        available_today = [
+            index for index in unassigned if point_can_be_on_day(points[index].point, window)
+        ]
         if not available_today:
             calendar_index += 1
             continue
 
-        seed = pick_seed(available_today, points, lookups)
+        prioritized_available = prioritize_candidates_for_day(available_today, day_position, feedback)
+        seed = pick_seed(prioritized_available, points, lookups)
         cluster = [seed]
         unassigned.remove(seed)
-        cluster_load = point_day_load(points[seed].point, window.date_value)
 
         while True:
-            candidates = [index for index in unassigned if point_can_be_on_day(points[index].point, window)]
+            candidates = [
+                index for index in unassigned if point_can_be_on_day(points[index].point, window)
+            ]
             if not candidates:
                 break
             if len(cluster) >= MAX_POINTS_PER_DAY:
                 break
-            next_index = pick_nearest_to_cluster(candidates, cluster, points, lookups)
-            has_food = cluster_has_food(cluster + [next_index], points)
-            capacity = effective_day_capacity(req, len(cluster) + 1, has_food)
-            next_load = point_day_load(points[next_index].point, window.date_value)
-            if cluster_load + next_load > capacity:
-                break
+            prioritized_candidates = prioritize_candidates_for_day(candidates, day_position, feedback)
+            next_index = pick_nearest_to_cluster(prioritized_candidates, cluster, points, lookups)
+            candidate_cluster = cluster + [next_index]
+            has_food = cluster_has_food(candidate_cluster, points)
+            capacity = effective_day_capacity(req, has_food)
+            feedback_hotel_index = (
+                feedback.hotel_per_day[day_position]
+                if feedback is not None and day_position < len(feedback.hotel_per_day)
+                else find_nearest_hotel(candidate_cluster, points, hotels, lookups)
+            )
+            previous_feedback_hotel_index = (
+                feedback.hotel_per_day[day_position - 1]
+                if feedback is not None and day_position > 0 and day_position - 1 < len(feedback.hotel_per_day)
+                else None
+            )
+            start_anchor = build_start_anchor(hotels, feedback_hotel_index, previous_feedback_hotel_index)
+            end_anchor = Anchor(
+                hotels[feedback_hotel_index].hotel.id,
+                hotels[feedback_hotel_index].arrival_coord,
+                hotels[feedback_hotel_index].departure_coord,
+            )
+            candidate_service_load = cluster_service_load(candidate_cluster, points, window.date_value)
+            candidate_travel_load = estimate_cluster_route_minutes(
+                req,
+                candidate_cluster,
+                points,
+                lookups,
+                start_anchor,
+                end_anchor,
+            )
+            if candidate_service_load + candidate_travel_load > capacity:
+                if prioritized_candidates != candidates:
+                    fallback_candidates = [index for index in candidates if index not in prioritized_candidates]
+                    if fallback_candidates:
+                        prioritized_candidates = fallback_candidates
+                        next_index = pick_nearest_to_cluster(prioritized_candidates, cluster, points, lookups)
+                        candidate_cluster = cluster + [next_index]
+                        has_food = cluster_has_food(candidate_cluster, points)
+                        capacity = effective_day_capacity(req, has_food)
+                        feedback_hotel_index = (
+                            feedback.hotel_per_day[day_position]
+                            if feedback is not None and day_position < len(feedback.hotel_per_day)
+                            else find_nearest_hotel(candidate_cluster, points, hotels, lookups)
+                        )
+                        start_anchor = build_start_anchor(hotels, feedback_hotel_index, previous_feedback_hotel_index)
+                        end_anchor = Anchor(
+                            hotels[feedback_hotel_index].hotel.id,
+                            hotels[feedback_hotel_index].arrival_coord,
+                            hotels[feedback_hotel_index].departure_coord,
+                        )
+                        candidate_service_load = cluster_service_load(candidate_cluster, points, window.date_value)
+                        candidate_travel_load = estimate_cluster_route_minutes(
+                            req,
+                            candidate_cluster,
+                            points,
+                            lookups,
+                            start_anchor,
+                            end_anchor,
+                        )
+                if candidate_service_load + candidate_travel_load > capacity:
+                    break
             cluster.append(next_index)
             unassigned.remove(next_index)
-            cluster_load += next_load
 
         if cluster:
             day_clusters.append((window, cluster))
@@ -704,6 +923,7 @@ def assign_hotel_per_day(
     hotels: list[HotelPrepared],
     lookups: LookupMaps,
     req: SolveRequest,
+    feedback: IterationFeedback | None = None,
 ) -> list[int]:
     clusters_only = [cluster for _, cluster in day_clusters]
     if req.hotelStrategy == "single":
@@ -715,15 +935,31 @@ def assign_hotel_per_day(
         return []
 
     all_point_indexes = [index for cluster in clusters_only for index in cluster]
-    current_hotel = find_nearest_hotel(all_point_indexes, points, hotels, lookups)
+    current_hotel = (
+        feedback.hotel_per_day[0]
+        if feedback is not None and feedback.hotel_per_day
+        else find_nearest_hotel(all_point_indexes, points, hotels, lookups)
+    )
     assignments: list[int] = []
 
-    for cluster in clusters_only:
+    for day_position, cluster in enumerate(clusters_only):
         best_for_day = find_nearest_hotel(cluster, points, hotels, lookups)
-        current_avg = average_one_way_driving_minutes(current_hotel, cluster, points, hotels, lookups)
+        incumbent_hotel = current_hotel
+        if feedback is not None and day_position < len(feedback.hotel_per_day):
+            prior_round_hotel = feedback.hotel_per_day[day_position]
+            prior_avg = average_one_way_driving_minutes(prior_round_hotel, cluster, points, hotels, lookups)
+            current_avg = average_one_way_driving_minutes(current_hotel, cluster, points, hotels, lookups)
+            if prior_avg < current_avg:
+                incumbent_hotel = prior_round_hotel
+
+        current_avg = average_one_way_driving_minutes(incumbent_hotel, cluster, points, hotels, lookups)
         best_avg = average_one_way_driving_minutes(best_for_day, cluster, points, hotels, lookups)
-        if current_avg > 40.0 and best_avg + 20.0 < current_avg:
-            current_hotel = best_for_day
+        if (
+            current_avg > HOTEL_SWITCH_TRIGGER_MINUTES
+            and best_avg + HOTEL_SWITCH_IMPROVEMENT_MINUTES < current_avg
+        ):
+            incumbent_hotel = best_for_day
+        current_hotel = incumbent_hotel
         assignments.append(current_hotel)
 
     return assignments
@@ -964,6 +1200,7 @@ def build_solver_diagnostics(
 
     return {
         "transportPreference": req.transportPreference,
+        "optimizationRounds": OPTIMIZATION_ROUNDS,
         "tripWindowDays": [window.date_value.isoformat() for window, _ in day_clusters],
         "hotelSwitches": hotel_switches,
         "totalTravelMinutes": total_travel,
@@ -990,15 +1227,43 @@ def build_solver_diagnostics(
     }
 
 
-def solve_itinerary(req: SolveRequest) -> SolveResponse:
-    validate_request(req)
-    points = prepare_points(req)
-    hotels = filter_hotels(req)
-    lookups = build_lookup_maps(req.distanceMatrix.rows)
-    day_clusters = cluster_points_to_days(req, points, lookups)
-    hotel_per_day = assign_hotel_per_day(day_clusters, points, hotels, lookups, req)
+def build_iteration_feedback(
+    day_clusters: list[tuple[DayWindow, list[int]]],
+    hotel_per_day: list[int],
+    day_routes: list[EvaluatedRoute],
+) -> IterationFeedback:
+    point_day_by_index: dict[int, int] = {}
+    point_order_by_index: dict[int, int] = {}
 
-    days: list[DayPlan] = []
+    for day_position, ((_, cluster), route) in enumerate(zip(day_clusters, day_routes)):
+        ordered_cluster = [cluster[position] for position in route.ordering]
+        for point_index in cluster:
+            point_day_by_index[point_index] = day_position
+        for order_position, point_index in enumerate(ordered_cluster):
+            point_order_by_index[point_index] = order_position
+
+    return IterationFeedback(
+        hotel_per_day=list(hotel_per_day),
+        point_day_by_index=point_day_by_index,
+        point_order_by_index=point_order_by_index,
+    )
+
+
+def solution_round_score(day_routes: list[EvaluatedRoute]) -> float:
+    total_cost = sum(route.effective_cost for route in day_routes)
+    hotel_switches = sum(1 for route in day_routes if route.diagnostics.hotel_switch)
+    return total_cost + hotel_switches * HOTEL_SWITCH_IMPROVEMENT_MINUTES
+
+
+def execute_planning_round(
+    req: SolveRequest,
+    points: list[PointPrepared],
+    hotels: list[HotelPrepared],
+    lookups: LookupMaps,
+    feedback: IterationFeedback | None,
+) -> tuple[list[tuple[DayWindow, list[int]]], list[int], list[EvaluatedRoute]]:
+    day_clusters = cluster_points_to_days(req, points, hotels, lookups, feedback)
+    hotel_per_day = assign_hotel_per_day(day_clusters, points, hotels, lookups, req, feedback)
     routes: list[EvaluatedRoute] = []
 
     for day_position, (window, cluster) in enumerate(day_clusters):
@@ -1053,6 +1318,43 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
                 ) from exc
 
         routes.append(route)
+
+    return day_clusters, hotel_per_day, routes
+
+
+def solve_itinerary(req: SolveRequest) -> SolveResponse:
+    validate_request(req)
+    points = prepare_points(req)
+    hotels = filter_hotels(req)
+    lookups = build_lookup_maps(req.distanceMatrix.rows)
+    feedback: IterationFeedback | None = None
+    best_day_clusters: list[tuple[DayWindow, list[int]]] | None = None
+    best_hotel_per_day: list[int] | None = None
+    best_routes: list[EvaluatedRoute] | None = None
+    best_score: float | None = None
+
+    for _ in range(OPTIMIZATION_ROUNDS):
+        day_clusters, hotel_per_day, routes = execute_planning_round(
+            req,
+            points,
+            hotels,
+            lookups,
+            feedback,
+        )
+        score = solution_round_score(routes)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_day_clusters = day_clusters
+            best_hotel_per_day = hotel_per_day
+            best_routes = routes
+        feedback = build_iteration_feedback(day_clusters, hotel_per_day, routes)
+
+    if best_day_clusters is None or best_hotel_per_day is None or best_routes is None:
+        raise HTTPException(status_code=500, detail="optimizer failed to produce itinerary")
+
+    days: list[DayPlan] = []
+    for day_position, ((window, _cluster), route) in enumerate(zip(best_day_clusters, best_routes)):
+        hotel_index = best_hotel_per_day[day_position]
         days.append(
             DayPlan(
                 dayNumber=day_position + 1,
@@ -1067,7 +1369,14 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
         solverStatus="FEASIBLE",
         objective="min_days_then_transport",
         days=days,
-        diagnostics=build_solver_diagnostics(req, day_clusters, hotel_per_day, points, hotels, routes),
+        diagnostics=build_solver_diagnostics(
+            req,
+            best_day_clusters,
+            best_hotel_per_day,
+            points,
+            hotels,
+            best_routes,
+        ),
     )
 
 
