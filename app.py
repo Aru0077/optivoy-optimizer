@@ -4,6 +4,7 @@ import itertools
 import math
 from dataclasses import dataclass
 from datetime import date, timedelta
+from functools import lru_cache
 from typing import Literal
 
 import numpy as np
@@ -40,6 +41,9 @@ GEO_ZIGZAG_PENALTY = 8.0
 HOTEL_SWITCH_TRIGGER_MINUTES = 60.0
 HOTEL_SWITCH_IMPROVEMENT_MINUTES = 30.0
 OPTIMIZATION_ROUNDS = 2
+EXACT_SOLVER_POINT_LIMIT = 12
+SMART_HOTEL_CANDIDATE_LIMIT = 5
+SINGLE_HOTEL_CANDIDATE_LIMIT = 12
 
 
 class CoordinateIn(BaseModel):
@@ -237,6 +241,21 @@ class IterationFeedback:
     point_order_by_index: dict[int, int]
 
 
+@dataclass(frozen=True)
+class ExactDayChoice:
+    hotel_index: int
+    route: EvaluatedRoute
+    total_cost: float
+
+
+@dataclass(frozen=True)
+class ExactPlan:
+    total_cost: float
+    day_masks: tuple[int, ...]
+    hotel_indexes: tuple[int, ...]
+    routes: tuple[EvaluatedRoute, ...]
+
+
 def parse_hhmm(value: str) -> int:
     hour, minute = value.split(":", 1)
     return int(hour) * 60 + int(minute)
@@ -377,26 +396,32 @@ def detect_city_profile(
     return CITY_PROFILES["default"]
 
 def point_arrival_coord(point: PointIn) -> Coord:
-    if point.arrivalAnchor and point.arrivalAnchor.latitude is not None and point.arrivalAnchor.longitude is not None:
+    if (
+        point.pointType == "spot"
+        and point.arrivalAnchor
+        and point.arrivalAnchor.latitude is not None
+        and point.arrivalAnchor.longitude is not None
+    ):
         return Coord(point.arrivalAnchor.latitude, point.arrivalAnchor.longitude)
     return Coord(point.latitude, point.longitude)
 
 
 def point_departure_coord(point: PointIn) -> Coord:
-    if point.departureAnchor and point.departureAnchor.latitude is not None and point.departureAnchor.longitude is not None:
+    if (
+        point.pointType == "spot"
+        and point.departureAnchor
+        and point.departureAnchor.latitude is not None
+        and point.departureAnchor.longitude is not None
+    ):
         return Coord(point.departureAnchor.latitude, point.departureAnchor.longitude)
     return Coord(point.latitude, point.longitude)
 
 
 def hotel_arrival_coord(hotel: HotelIn) -> Coord:
-    if hotel.arrivalAnchor and hotel.arrivalAnchor.latitude is not None and hotel.arrivalAnchor.longitude is not None:
-        return Coord(hotel.arrivalAnchor.latitude, hotel.arrivalAnchor.longitude)
     return Coord(hotel.latitude, hotel.longitude)
 
 
 def hotel_departure_coord(hotel: HotelIn) -> Coord:
-    if hotel.departureAnchor and hotel.departureAnchor.latitude is not None and hotel.departureAnchor.longitude is not None:
-        return Coord(hotel.departureAnchor.latitude, hotel.departureAnchor.longitude)
     return Coord(hotel.latitude, hotel.longitude)
 
 
@@ -475,6 +500,8 @@ def weekday_periods(point: PointIn, day_value: date) -> list[tuple[int, int]]:
 def day_is_closed(point: PointIn, day_value: date) -> bool:
     if day_value in point.specialClosureDates:
         return True
+    if not point.openingHoursJson:
+        return False
     return len(weekday_periods(point, day_value)) == 0
 
 
@@ -483,6 +510,18 @@ def validate_request(req: SolveRequest) -> None:
         raise HTTPException(status_code=400, detail="unsupported transportPreference")
     if req.hotelStrategy == "single" and len(req.hotels) == 0:
         raise HTTPException(status_code=400, detail="single hotel mode requires hotels")
+    point_ids = [point.id for point in req.points]
+    if len(set(point_ids)) != len(point_ids):
+        raise HTTPException(status_code=400, detail="point ids must be unique")
+    hotel_ids = [hotel.id for hotel in req.hotels]
+    if len(set(hotel_ids)) != len(hotel_ids):
+        raise HTTPException(status_code=400, detail="hotel ids must be unique")
+    overlap = set(point_ids) & set(hotel_ids)
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "DUPLICATE_NODE_IDS", "nodeIds": sorted(overlap)},
+        )
 
 
 def filter_hotels(req: SolveRequest) -> list[HotelPrepared]:
@@ -496,6 +535,11 @@ def filter_hotels(req: SolveRequest) -> list[HotelPrepared]:
     ]
     if not prepared:
         raise HTTPException(status_code=400, detail="no eligible hotels provided")
+    for item in prepared:
+        if item.arrival_coord.lat is None or item.arrival_coord.lng is None:
+            raise HTTPException(status_code=400, detail=f"hotel {item.hotel.id} missing coordinate")
+        if item.departure_coord.lat is None or item.departure_coord.lng is None:
+            raise HTTPException(status_code=400, detail=f"hotel {item.hotel.id} missing coordinate")
     return prepared
 
 
@@ -603,13 +647,14 @@ def lookup_travel_choice(
     to_coord: Coord,
     req: SolveRequest,
     lookups: LookupMaps,
+    walk_threshold_meters: int = WALK_THRESHOLD_METERS,
 ) -> EdgeChoice:
     walking_distance = lookup_walking_distance(from_id, from_coord, to_id, to_coord, lookups)
     walking_minutes, walking_fallback, _ = lookup_mode_minutes("walking", from_id, from_coord, to_id, to_coord, lookups)
     transit_minutes, transit_fallback, transit_summary = lookup_mode_minutes("transit", from_id, from_coord, to_id, to_coord, lookups)
     driving_minutes, driving_fallback, _ = lookup_mode_minutes("driving", from_id, from_coord, to_id, to_coord, lookups)
 
-    if 0 < walking_distance <= WALK_THRESHOLD_METERS:
+    if 0 < walking_distance <= walk_threshold_meters:
         return EdgeChoice(minutes=walking_minutes, mode="walking", used_fallback=walking_fallback)
     if req.transportPreference == "transit_first":
         return EdgeChoice(minutes=transit_minutes, mode="transit", used_fallback=transit_fallback, summary=transit_summary)
@@ -666,14 +711,10 @@ def point_can_be_on_day(point: PointIn, window: DayWindow) -> bool:
         return False
     if day_is_closed(point, window.date_value):
         return False
-    if point.pointType == "spot" and not point.lastEntryTime:
-        return False
-    # Check lastEntryTime: if day starts at or after lastEntry, this spot can never be entered
     if point.lastEntryTime:
         last_entry = parse_hhmm(point.lastEntryTime)
         if window.start_minutes >= last_entry:
             return False
-    # Check that the point can actually complete within some opening period on this day
     load = point_day_load(point, window.date_value)
     periods = weekday_periods(point, window.date_value)
     if periods:
@@ -692,8 +733,6 @@ def point_can_be_on_day_v25(point: PointIn, window: DayWindow, profile: CityProf
     if window.end_minutes <= window.start_minutes:
         return False
     if day_is_closed(point, window.date_value):
-        return False
-    if point.pointType == "spot" and not point.lastEntryTime:
         return False
     if point.lastEntryTime:
         last_entry = parse_hhmm(point.lastEntryTime)
@@ -1654,14 +1693,27 @@ def assign_hotel_per_day(
     return assignments
 
 
-def opening_period_for_arrival(point: PointIn, day_value: date, arrival_minutes: int) -> tuple[int, int] | None:
+def opening_period_for_arrival(
+    point: PointIn,
+    day_value: date,
+    arrival_minutes: int,
+    service_minutes: int,
+) -> tuple[int, int] | None:
     periods = weekday_periods(point, day_value)
     last_entry = parse_hhmm(point.lastEntryTime) if point.lastEntryTime else None
+    if not periods:
+        if last_entry is not None and arrival_minutes > last_entry:
+            return None
+        start_candidate = max(0, arrival_minutes)
+        if start_candidate + service_minutes > 24 * 60:
+            return None
+        return start_candidate, 24 * 60
     for period_start, period_end in periods:
         start_candidate = max(arrival_minutes, period_start)
         if last_entry is not None and start_candidate > last_entry:
             continue
-        return start_candidate, period_end
+        if start_candidate + service_minutes <= period_end:
+            return start_candidate, period_end
     return None
 
 
@@ -1716,6 +1768,7 @@ def evaluate_order(
     transport_modes = {"walking": 0, "transit": 0, "driving": 0}
     queue_total = 0
     travel_total = 0
+    driving_total = 0
     wait_total = 0
     fallback_edges = 0
     lunch_inserted = False
@@ -1727,10 +1780,20 @@ def evaluate_order(
 
     for route_point in route_points:
         point = route_point.point
-        choice = lookup_travel_choice(current_id, current_coord, point.id, route_point.arrival_coord, req, lookups)
+        choice = lookup_travel_choice(
+            current_id,
+            current_coord,
+            point.id,
+            route_point.arrival_coord,
+            req,
+            lookups,
+            profile.walk_threshold_meters,
+        )
 
         transport_modes[choice.mode] += 1
         travel_total += choice.minutes
+        if choice.mode == "driving":
+            driving_total += choice.minutes
         fallback_edges += int(choice.used_fallback)
         current_time += choice.minutes
 
@@ -1751,7 +1814,15 @@ def evaluate_order(
         if day_is_closed(point, day_window.date_value):
             raise HTTPException(status_code=400, detail=f"point {point.id} closed on scheduled day")
 
-        open_period = opening_period_for_arrival(point, day_window.date_value, current_time)
+        queue_minutes = queue_minutes_for_day(point, day_window.date_value)
+        queue_total += queue_minutes
+        service_minutes = point_visit_minutes_v25(point, profile) + queue_minutes
+        open_period = opening_period_for_arrival(
+            point,
+            day_window.date_value,
+            current_time,
+            service_minutes,
+        )
         if open_period is None:
             raise HTTPException(status_code=400, detail=f"point {point.id} has no feasible time window")
 
@@ -1759,9 +1830,7 @@ def evaluate_order(
         wait_total += max(0, service_start - current_time)
         current_time = service_start
 
-        queue_minutes = queue_minutes_for_day(point, day_window.date_value)
-        queue_total += queue_minutes
-        service_end = current_time + point_visit_minutes_v25(point, profile) + queue_minutes
+        service_end = current_time + service_minutes
         if service_end > service_window_end or service_end > day_end_limit:
             raise HTTPException(status_code=400, detail=f"point {point.id} exceeds open window")
 
@@ -1769,11 +1838,30 @@ def evaluate_order(
         current_id = point.id
         current_coord = route_point.departure_coord
 
-    hotel_choice = lookup_travel_choice(current_id, current_coord, hotel.hotel.id, hotel.arrival_coord, req, lookups)
+    hotel_choice = lookup_travel_choice(
+        current_id,
+        current_coord,
+        hotel.hotel.id,
+        hotel.arrival_coord,
+        req,
+        lookups,
+        profile.walk_threshold_meters,
+    )
     transport_modes[hotel_choice.mode] += 1
     travel_total += hotel_choice.minutes
+    if hotel_choice.mode == "driving":
+        driving_total += hotel_choice.minutes
     fallback_edges += int(hotel_choice.used_fallback)
     current_time += hotel_choice.minutes
+
+    if driving_total > req.maxIntradayDrivingMinutes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"driving minutes {driving_total} exceed daily limit "
+                f"{req.maxIntradayDrivingMinutes}"
+            ),
+        )
 
     if previous_hotel_index is not None and previous_hotel_index != hotel_index and hotel.hotel.checkInTime is not None:
         check_in_minutes = parse_hhmm(hotel.hotel.checkInTime)
@@ -2276,6 +2364,312 @@ def solution_round_score(day_routes: list[EvaluatedRoute]) -> float:
     return total_cost + hotel_switches * HOTEL_SWITCH_IMPROVEMENT_MINUTES
 
 
+def solve_itinerary_exact(req: SolveRequest) -> SolveResponse:
+    validate_request(req)
+    points = prepare_points(req)
+    hotels = filter_hotels(req)
+    lookups = build_lookup_maps(req.distanceMatrix.rows)
+    matrix = build_matrix_store(points, hotels, req.distanceMatrix.rows)
+    profile = detect_city_profile(req.city, points, matrix)
+
+    point_count = len(points)
+    full_mask = (1 << point_count) - 1
+    day_windows = [build_day_window(req, day_index) for day_index in range(point_count)]
+    point_indexes_np = np.array(
+        [matrix.id_to_idx[item.point.id] for item in points],
+        dtype=np.int32,
+    )
+    hotel_indexes_np = np.array(
+        [matrix.id_to_idx[item.hotel.id] for item in hotels],
+        dtype=np.int32,
+    )
+    point_day_allowed = [
+        [point_can_be_on_day_v25(item.point, window, profile) for item in points]
+        for window in day_windows
+    ]
+
+    @lru_cache(maxsize=None)
+    def mask_to_indexes(mask: int) -> tuple[int, ...]:
+        return tuple(index for index in range(point_count) if mask & (1 << index))
+
+    @lru_cache(maxsize=None)
+    def mask_has_food(mask: int) -> bool:
+        indexes = mask_to_indexes(mask)
+        return cluster_has_food(list(indexes), points)
+
+    @lru_cache(maxsize=None)
+    def mask_geo_score(mask: int) -> float:
+        indexes = mask_to_indexes(mask)
+        if len(indexes) <= 1:
+            return 0.0
+        matrix_indexes = np.array(
+            [matrix.id_to_idx[points[index].point.id] for index in indexes],
+            dtype=np.int32,
+        )
+        sub_driving = matrix.driving[np.ix_(matrix_indexes, matrix_indexes)]
+        positive = sub_driving[sub_driving > 0]
+        return float(positive.mean()) if positive.size > 0 else 0.0
+
+    @lru_cache(maxsize=None)
+    def rough_day_feasible(mask: int, day_position: int) -> bool:
+        indexes = mask_to_indexes(mask)
+        if not indexes:
+            return False
+        if len(indexes) > profile.max_points_per_day:
+            return False
+        if day_position >= len(day_windows):
+            return False
+        window = day_windows[day_position]
+        if any(not point_day_allowed[day_position][index] for index in indexes):
+            return False
+        service_load = sum(
+            point_day_load_v25(points[index].point, window.date_value, profile)
+            for index in indexes
+        )
+        lunch_load = 0
+        if req.mealPolicy != "off" and not mask_has_food(mask):
+            lunch_load = LUNCH_OVERHEAD_MINUTES
+        capacity = int(PACE_MODE_WINDOWS[req.paceMode][2] * profile.day_capacity_buffer)
+        return service_load + lunch_load <= capacity
+
+    @lru_cache(maxsize=None)
+    def ordered_submasks(mask: int, day_position: int) -> tuple[int, ...]:
+        feasible: list[int] = []
+        submask = mask
+        while submask:
+            if rough_day_feasible(submask, day_position):
+                feasible.append(submask)
+            submask = (submask - 1) & mask
+        feasible.sort(
+            key=lambda item: (
+                -item.bit_count(),
+                mask_geo_score(item),
+                tuple(points[index].point.id for index in mask_to_indexes(item)),
+            )
+        )
+        return tuple(feasible)
+
+    def build_route_cost(route: EvaluatedRoute, hotel_index: int, previous_hotel_index: int | None) -> float:
+        switch_penalty = 0.0
+        if (
+            req.hotelStrategy == "smart"
+            and previous_hotel_index is not None
+            and previous_hotel_index != hotel_index
+        ):
+            switch_penalty = profile.hotel_switch_improve_min
+        return route.effective_cost + switch_penalty
+
+    @lru_cache(maxsize=None)
+    def rank_single_hotel_candidates() -> tuple[int, ...]:
+        if len(hotels) <= SINGLE_HOTEL_CANDIDATE_LIMIT:
+            return tuple(range(len(hotels)))
+        to_points = matrix.driving[np.ix_(hotel_indexes_np, point_indexes_np)]
+        from_points = matrix.driving[np.ix_(point_indexes_np, hotel_indexes_np)].T
+        avg_round_trip = (to_points + from_points).mean(axis=1)
+        top_k = min(SINGLE_HOTEL_CANDIDATE_LIMIT, len(hotels))
+        top_indexes = np.argpartition(avg_round_trip, top_k - 1)[:top_k]
+        ranked = sorted(top_indexes.tolist(), key=lambda item: float(avg_round_trip[item]))
+        return tuple(ranked)
+
+    @lru_cache(maxsize=None)
+    def rank_smart_hotels(mask: int, previous_hotel_key: int) -> tuple[int, ...]:
+        indexes = mask_to_indexes(mask)
+        if not indexes:
+            return (0,)
+        point_matrix_indexes = np.array(
+            [matrix.id_to_idx[points[index].point.id] for index in indexes],
+            dtype=np.int32,
+        )
+        to_points = matrix.driving[np.ix_(hotel_indexes_np, point_matrix_indexes)]
+        from_points = matrix.driving[np.ix_(point_matrix_indexes, hotel_indexes_np)].T
+        avg_round_trip = (to_points + from_points).mean(axis=1)
+        limit = min(SMART_HOTEL_CANDIDATE_LIMIT, len(hotels))
+        top_indexes = np.argpartition(avg_round_trip, limit - 1)[:limit]
+        ranked = sorted(top_indexes.tolist(), key=lambda item: float(avg_round_trip[item]))
+        previous_hotel_index = None if previous_hotel_key < 0 else previous_hotel_key
+        if previous_hotel_index is not None and previous_hotel_index not in ranked:
+            ranked.append(previous_hotel_index)
+        return tuple(ranked)
+
+    @lru_cache(maxsize=None)
+    def solve_day_exact_single(day_position: int, mask: int, fixed_hotel_index: int) -> ExactDayChoice | None:
+        if not rough_day_feasible(mask, day_position):
+            return None
+        window = day_windows[day_position]
+        cluster = list(mask_to_indexes(mask))
+        previous_hotel_index = fixed_hotel_index if day_position > 0 else None
+        try:
+            route = solve_day_route(
+                req,
+                points,
+                hotels,
+                profile,
+                window,
+                fixed_hotel_index,
+                cluster,
+                build_start_anchor(hotels, fixed_hotel_index, previous_hotel_index),
+                previous_hotel_index,
+                day_position == point_count - 1,
+                lookups,
+            )
+        except HTTPException:
+            return None
+        return ExactDayChoice(
+            hotel_index=fixed_hotel_index,
+            route=route,
+            total_cost=build_route_cost(route, fixed_hotel_index, previous_hotel_index),
+        )
+
+    @lru_cache(maxsize=None)
+    def solve_day_exact_smart(day_position: int, mask: int, previous_hotel_key: int) -> ExactDayChoice | None:
+        if not rough_day_feasible(mask, day_position):
+            return None
+        window = day_windows[day_position]
+        cluster = list(mask_to_indexes(mask))
+        previous_hotel_index = None if previous_hotel_key < 0 else previous_hotel_key
+        best_choice: ExactDayChoice | None = None
+        for hotel_index in rank_smart_hotels(mask, previous_hotel_key):
+            try:
+                route = solve_day_route(
+                    req,
+                    points,
+                    hotels,
+                    profile,
+                    window,
+                    hotel_index,
+                    cluster,
+                    build_start_anchor(hotels, hotel_index, previous_hotel_index),
+                    previous_hotel_index,
+                    day_position == point_count - 1,
+                    lookups,
+                )
+            except HTTPException:
+                continue
+            candidate = ExactDayChoice(
+                hotel_index=hotel_index,
+                route=route,
+                total_cost=build_route_cost(route, hotel_index, previous_hotel_index),
+            )
+            if best_choice is None or candidate.total_cost < best_choice.total_cost:
+                best_choice = candidate
+        return best_choice
+
+    @lru_cache(maxsize=None)
+    def search_single(mask: int, day_position: int, fixed_hotel_index: int) -> ExactPlan | None:
+        if mask == 0:
+            return ExactPlan(0.0, tuple(), tuple(), tuple())
+        best_plan: ExactPlan | None = None
+        for day_mask in ordered_submasks(mask, day_position):
+            day_choice = solve_day_exact_single(day_position, day_mask, fixed_hotel_index)
+            if day_choice is None:
+                continue
+            remainder = mask ^ day_mask
+            next_plan = search_single(remainder, day_position + 1, fixed_hotel_index)
+            if next_plan is None:
+                continue
+            total_cost = day_choice.total_cost + next_plan.total_cost
+            candidate = ExactPlan(
+                total_cost=total_cost,
+                day_masks=(day_mask,) + next_plan.day_masks,
+                hotel_indexes=(fixed_hotel_index,) + next_plan.hotel_indexes,
+                routes=(day_choice.route,) + next_plan.routes,
+            )
+            if best_plan is None or candidate.total_cost < best_plan.total_cost:
+                best_plan = candidate
+        return best_plan
+
+    @lru_cache(maxsize=None)
+    def search_smart(mask: int, day_position: int, previous_hotel_key: int) -> ExactPlan | None:
+        if mask == 0:
+            return ExactPlan(0.0, tuple(), tuple(), tuple())
+        best_plan: ExactPlan | None = None
+        for day_mask in ordered_submasks(mask, day_position):
+            day_choice = solve_day_exact_smart(day_position, day_mask, previous_hotel_key)
+            if day_choice is None:
+                continue
+            remainder = mask ^ day_mask
+            next_plan = search_smart(remainder, day_position + 1, day_choice.hotel_index)
+            if next_plan is None:
+                continue
+            total_cost = day_choice.total_cost + next_plan.total_cost
+            candidate = ExactPlan(
+                total_cost=total_cost,
+                day_masks=(day_mask,) + next_plan.day_masks,
+                hotel_indexes=(day_choice.hotel_index,) + next_plan.hotel_indexes,
+                routes=(day_choice.route,) + next_plan.routes,
+            )
+            if best_plan is None or candidate.total_cost < best_plan.total_cost:
+                best_plan = candidate
+        return best_plan
+
+    if req.hotelStrategy == "single":
+        best_plan: ExactPlan | None = None
+        for fixed_hotel_index in rank_single_hotel_candidates():
+            candidate = search_single(full_mask, 0, fixed_hotel_index)
+            if candidate is None:
+                continue
+            if best_plan is None or candidate.total_cost < best_plan.total_cost:
+                best_plan = candidate
+    else:
+        best_plan = search_smart(full_mask, 0, -1)
+
+    if best_plan is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NO_FEASIBLE_ITINERARY",
+                "message": "no feasible itinerary for current constraints",
+            },
+        )
+
+    best_day_clusters = [
+        (day_windows[day_position], list(mask_to_indexes(day_mask)))
+        for day_position, day_mask in enumerate(best_plan.day_masks)
+    ]
+    best_hotel_per_day = list(best_plan.hotel_indexes)
+    best_routes = list(best_plan.routes)
+
+    days: list[DayPlan] = []
+    for day_position, route in enumerate(best_routes):
+        days.append(
+            DayPlan(
+                dayNumber=day_position + 1,
+                date=day_windows[day_position].date_value.isoformat(),
+                pointIds=route.point_ids,
+                hotelId=hotels[best_hotel_per_day[day_position]].hotel.id,
+            )
+        )
+
+    diagnostics = build_solver_diagnostics(
+        req,
+        best_day_clusters,
+        best_hotel_per_day,
+        points,
+        hotels,
+        best_routes,
+    )
+    diagnostics["optimizationRounds"] = 1
+    diagnostics["cityProfile"] = {
+        "walkThresholdMeters": profile.walk_threshold_meters,
+        "hotelSwitchTriggerMin": profile.hotel_switch_trigger_min,
+        "hotelSwitchImproveMin": profile.hotel_switch_improve_min,
+        "maxPointsPerDay": profile.max_points_per_day,
+        "staminaFactor": profile.stamina_factor,
+        "dayCapacityBuffer": profile.day_capacity_buffer,
+    }
+
+    result = SolveResponse(
+        tripDays=len(days),
+        solverStatus="OPTIMAL",
+        objective="min_total_exact_cost",
+        days=days,
+        diagnostics=diagnostics,
+    )
+    warnings = validate_solution_universally_v25(result, req, points, hotels, lookups, profile)
+    result.diagnostics["validationWarnings"] = warnings
+    return result
+
+
 def execute_planning_round(
     req: SolveRequest,
     points: list[PointPrepared],
@@ -2346,7 +2740,7 @@ def execute_planning_round(
     return day_clusters, hotel_per_day, routes
 
 
-def solve_itinerary(req: SolveRequest) -> SolveResponse:
+def solve_itinerary_legacy(req: SolveRequest) -> SolveResponse:
     validate_request(req)
     points = prepare_points(req)
     hotels = filter_hotels(req)
@@ -2464,6 +2858,12 @@ def solve_itinerary(req: SolveRequest) -> SolveResponse:
         if warnings:
             result.diagnostics["validationWarnings"] = warnings
     return result
+
+
+def solve_itinerary(req: SolveRequest) -> SolveResponse:
+    if len(req.points) <= EXACT_SOLVER_POINT_LIMIT:
+        return solve_itinerary_exact(req)
+    return solve_itinerary_legacy(req)
 
 
 @app.get("/health")
