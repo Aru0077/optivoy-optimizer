@@ -1,0 +1,121 @@
+{
+  "name": "blank_day_due_to_closure",
+  "request": {
+    "city": "Beijing",
+    "province": "Beijing",
+    "startDate": "2026-07-15",
+    "calendarDays": [
+      {
+        "date": "2026-07-15",
+        "dayType": "weekday"
+      },
+      {
+        "date": "2026-07-16",
+        "dayType": "weekday"
+      },
+      {
+        "date": "2026-07-17",
+        "dayType": "weekday"
+      }
+    ],
+    "paceMode": "standard",
+    "hotelStrategy": "single",
+    "mealPolicy": "off",
+    "transportPreference": "mixed",
+    "maxIntradayDrivingMinutes": 120,
+    "points": [
+      {
+        "id": "day2-point",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.915,
+        "longitude": 116.405,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-15",
+          "2026-07-17"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      },
+      {
+        "id": "day3-point",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.925,
+        "longitude": 116.415,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-15",
+          "2026-07-16"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      }
+    ],
+    "hotels": [
+      {
+        "id": "hotel-single",
+        "latitude": 39.916,
+        "longitude": 116.406
+      }
+    ],
+    "distanceMatrix": {
+      "rows": [
+        {
+          "fromPointId": "hotel-single",
+          "toPointId": "day2-point",
+          "transitMinutes": 8,
+          "drivingMinutes": 6,
+          "walkingMeters": 400,
+          "walkingMinutes": 5,
+          "distanceKm": 0.6,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "day2-point",
+          "toPointId": "hotel-single",
+          "transitMinutes": 8,
+          "drivingMinutes": 6,
+          "walkingMeters": 400,
+          "walkingMinutes": 5,
+          "distanceKm": 0.6,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "hotel-single",
+          "toPointId": "day3-point",
+          "transitMinutes": 16,
+          "drivingMinutes": 12,
+          "walkingMeters": 1800,
+          "walkingMinutes": 22,
+          "distanceKm": 2.4,
+          "transitSummary": "metro"
+        },
+        {
+          "fromPointId": "day3-point",
+          "toPointId": "hotel-single",
+          "transitMinutes": 16,
+          "drivingMinutes": 12,
+          "walkingMeters": 1800,
+          "walkingMinutes": 22,
+          "distanceKm": 2.4,
+          "transitSummary": "metro"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "solverStatus": "OPTIMAL",
+    "tripDays": 3,
+    "blankDays": 1,
+    "dayTypesByDay": {
+      "1": "blank",
+      "2": "visit",
+      "3": "visit"
+    },
+    "blankReasonByDay": {
+      "1": "all_remaining_points_closed_on_this_date"
+    }
+  }
+}

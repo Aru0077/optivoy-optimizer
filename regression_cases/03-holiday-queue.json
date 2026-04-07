@@ -1,0 +1,79 @@
+{
+  "name": "holiday_queue_profile",
+  "request": {
+    "city": "Beijing",
+    "province": "Beijing",
+    "startDate": "2026-10-01",
+    "calendarDays": [
+      {
+        "date": "2026-10-01",
+        "dayType": "holiday"
+      }
+    ],
+    "paceMode": "standard",
+    "hotelStrategy": "single",
+    "mealPolicy": "off",
+    "transportPreference": "mixed",
+    "maxIntradayDrivingMinutes": 120,
+    "points": [
+      {
+        "id": "holiday-point",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 90,
+        "latitude": 39.915,
+        "longitude": 116.405,
+        "openingHoursJson": [],
+        "specialClosureDates": [],
+        "lastEntryTime": null,
+        "queueProfileJson": {
+          "weekdayMinutes": 10,
+          "weekendMinutes": 25,
+          "holidayMinutes": 55
+        },
+        "hasFoodCourt": false
+      }
+    ],
+    "hotels": [
+      {
+        "id": "hotel-single",
+        "latitude": 39.916,
+        "longitude": 116.406
+      }
+    ],
+    "distanceMatrix": {
+      "rows": [
+        {
+          "fromPointId": "hotel-single",
+          "toPointId": "holiday-point",
+          "transitMinutes": 8,
+          "drivingMinutes": 6,
+          "walkingMeters": 400,
+          "walkingMinutes": 5,
+          "distanceKm": 0.6,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "holiday-point",
+          "toPointId": "hotel-single",
+          "transitMinutes": 8,
+          "drivingMinutes": 6,
+          "walkingMeters": 400,
+          "walkingMinutes": 5,
+          "distanceKm": 0.6,
+          "transitSummary": "walk"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "solverStatus": "OPTIMAL",
+    "tripDays": 1,
+    "blankDays": 0,
+    "queueMinutesByDay": {
+      "1": 55
+    },
+    "dayTypesByDay": {
+      "1": "visit"
+    }
+  }
+}

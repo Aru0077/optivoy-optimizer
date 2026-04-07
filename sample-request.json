@@ -2,6 +2,28 @@
   "city": "Beijing",
   "province": "Beijing",
   "startDate": "2026-07-15",
+  "calendarDays": [
+    {
+      "date": "2026-07-15",
+      "dayType": "weekday"
+    },
+    {
+      "date": "2026-07-16",
+      "dayType": "weekday"
+    },
+    {
+      "date": "2026-07-17",
+      "dayType": "weekday"
+    },
+    {
+      "date": "2026-07-18",
+      "dayType": "weekend"
+    },
+    {
+      "date": "2026-07-19",
+      "dayType": "weekend"
+    }
+  ],
   "paceMode": "standard",
   "hotelStrategy": "smart",
   "mealPolicy": "auto",
@@ -82,9 +104,7 @@
       "departureAnchor": {
         "latitude": 39.9332,
         "longitude": 116.4079
-      },
-      "checkInTime": "15:00",
-      "checkOutTime": "12:00"
+      }
     },
     {
       "id": "hotel-chaoyang",
@@ -97,9 +117,7 @@
       "departureAnchor": {
         "latitude": 39.9209,
         "longitude": 116.4558
-      },
-      "checkInTime": "15:00",
-      "checkOutTime": "12:00"
+      }
     }
   ],
   "distanceMatrix": {

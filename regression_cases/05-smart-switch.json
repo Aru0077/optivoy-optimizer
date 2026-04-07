@@ -1,0 +1,297 @@
+{
+  "name": "smart_switch_with_transfer_and_run_length_rules",
+  "request": {
+    "city": "北京",
+    "province": "北京",
+    "startDate": "2026-07-15",
+    "calendarDays": [
+      {
+        "date": "2026-07-15",
+        "dayType": "weekday"
+      },
+      {
+        "date": "2026-07-16",
+        "dayType": "weekday"
+      },
+      {
+        "date": "2026-07-17",
+        "dayType": "weekday"
+      },
+      {
+        "date": "2026-07-18",
+        "dayType": "weekend"
+      }
+    ],
+    "paceMode": "standard",
+    "hotelStrategy": "smart",
+    "mealPolicy": "off",
+    "transportPreference": "driving_first",
+    "maxIntradayDrivingMinutes": 400,
+    "points": [
+      {
+        "id": "day1-a",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.91,
+        "longitude": 116.30,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-16",
+          "2026-07-17",
+          "2026-07-18"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      },
+      {
+        "id": "day2-a",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.915,
+        "longitude": 116.305,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-15",
+          "2026-07-17",
+          "2026-07-18"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      },
+      {
+        "id": "day3-b",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.94,
+        "longitude": 116.47,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-15",
+          "2026-07-16",
+          "2026-07-18"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      },
+      {
+        "id": "day4-b",
+        "pointType": "spot",
+        "suggestedDurationMinutes": 120,
+        "latitude": 39.945,
+        "longitude": 116.475,
+        "openingHoursJson": [],
+        "specialClosureDates": [
+          "2026-07-15",
+          "2026-07-16",
+          "2026-07-17"
+        ],
+        "lastEntryTime": null,
+        "hasFoodCourt": false
+      }
+    ],
+    "hotels": [
+      {
+        "id": "hotel-a",
+        "latitude": 39.912,
+        "longitude": 116.302
+      },
+      {
+        "id": "hotel-b",
+        "latitude": 39.942,
+        "longitude": 116.472
+      }
+    ],
+    "distanceMatrix": {
+      "rows": [
+        {
+          "fromPointId": "hotel-a",
+          "toPointId": "day1-a",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "day1-a",
+          "toPointId": "hotel-a",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "hotel-a",
+          "toPointId": "day2-a",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "day2-a",
+          "toPointId": "hotel-a",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "hotel-b",
+          "toPointId": "day3-b",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "day3-b",
+          "toPointId": "hotel-b",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "hotel-b",
+          "toPointId": "day4-b",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "day4-b",
+          "toPointId": "hotel-b",
+          "transitMinutes": 12,
+          "drivingMinutes": 5,
+          "walkingMeters": 500,
+          "walkingMinutes": 6,
+          "distanceKm": 0.8,
+          "transitSummary": "walk"
+        },
+        {
+          "fromPointId": "hotel-a",
+          "toPointId": "day3-b",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "day3-b",
+          "toPointId": "hotel-a",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "hotel-a",
+          "toPointId": "day4-b",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "day4-b",
+          "toPointId": "hotel-a",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "hotel-b",
+          "toPointId": "day1-a",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "day1-a",
+          "toPointId": "hotel-b",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "hotel-b",
+          "toPointId": "day2-a",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "day2-a",
+          "toPointId": "hotel-b",
+          "transitMinutes": 160,
+          "drivingMinutes": 140,
+          "walkingMeters": 18000,
+          "walkingMinutes": 220,
+          "distanceKm": 20.0,
+          "transitSummary": "far"
+        },
+        {
+          "fromPointId": "hotel-a",
+          "toPointId": "hotel-b",
+          "transitMinutes": 80,
+          "drivingMinutes": 60,
+          "walkingMeters": 15000,
+          "walkingMinutes": 180,
+          "distanceKm": 18.0,
+          "transitSummary": "cross-city"
+        },
+        {
+          "fromPointId": "hotel-b",
+          "toPointId": "hotel-a",
+          "transitMinutes": 80,
+          "drivingMinutes": 60,
+          "walkingMeters": 15000,
+          "walkingMinutes": 180,
+          "distanceKm": 18.0,
+          "transitSummary": "cross-city"
+        }
+      ]
+    }
+  },
+  "expect": {
+    "solverStatus": "OPTIMAL",
+    "tripDays": 4,
+    "blankDays": 0,
+    "requireSmartHotelRules": true,
+    "minHotelSwitches": 1,
+    "requireHotelTransferOnSwitchDays": true
+  }
+}
